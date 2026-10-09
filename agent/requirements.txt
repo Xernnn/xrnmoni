@@ -1,0 +1,5 @@
+psutil>=5.9
+requests>=2.31
+tomli>=2.0; python_version < "3.11"
+pywin32>=306; sys_platform == "win32"
+python-xlib>=0.33; sys_platform == "linux"

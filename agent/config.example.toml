@@ -1,0 +1,25 @@
+# Copy to config.toml and edit. One per machine.
+
+# Where the central server is reachable from THIS machine.
+# Use the server's LAN IP (or hostname / tailscale name), not localhost,
+# unless the server runs on this same machine.
+server_url = "http://192.168.1.10:8000"
+
+# Must match XRNMONI_TOKEN on the server.
+token = "change-me"
+
+# Friendly name shown in the dashboard. Defaults to the hostname if omitted.
+device = "kids-pc"
+
+# How often to sample the foreground window, in seconds.
+poll_interval = 2.0
+
+# How often to flush buffered events to the server, in seconds.
+flush_interval = 10.0
+
+# Mark time as idle/AFK after this many seconds with no input.
+# (X11 + xprintidle, or Windows. Not available on Hyprland/Wayland.)
+afk_threshold = 60.0
+
+# Localhost port the browser extension posts to. Match extension config.
+bridge_port = 8129

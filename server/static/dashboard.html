@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>xrnmoni</title>
+<style>
+  :root {
+    --bg: #0f1117; --panel: #171a23; --panel2: #1e222d; --line: #2a2f3c;
+    --fg: #e6e8ee; --muted: #8b93a7; --accent: #6ea8fe; --accent2: #7ee081;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  header {
+    display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+    padding: 14px 18px; background: var(--panel); border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; z-index: 5;
+  }
+  header h1 { font-size: 16px; margin: 0 8px 0 0; letter-spacing: .5px; }
+  header .spacer { flex: 1; }
+  select, input, button {
+    background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 8px; padding: 7px 10px; font: inherit;
+  }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+  .online { background: var(--accent2); } .offline { background: #5a6072; }
+  main { padding: 18px; max-width: 1100px; margin: 0 auto; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 18px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; }
+  .card .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .5px; }
+  .card .v { font-size: 22px; font-weight: 600; margin-top: 4px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 760px) { .grid2 { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; margin-bottom: 16px; }
+  .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); margin: 0 0 12px; }
+  .bar-row { display: grid; grid-template-columns: 160px 1fr 70px; gap: 10px; align-items: center; margin-bottom: 7px; }
+  .bar-row .name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .bar-track { background: var(--panel2); border-radius: 6px; height: 16px; overflow: hidden; }
+  .bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent), #8f7bff); }
+  .bar-fill.web { background: linear-gradient(90deg, var(--accent2), #4fd0c0); }
+  .num { color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  td.dur { text-align: right; color: var(--accent); }
+  .tag { font-size: 11px; padding: 1px 7px; border-radius: 20px; border: 1px solid var(--line); color: var(--muted); }
+  .tag.app { color: var(--accent); border-color: #2d3a57; }
+  .tag.browser { color: var(--accent2); border-color: #26463a; }
+  .tag.afk { color: #c9a227; border-color: #4a4320; }
+  .empty { color: var(--muted); padding: 20px; text-align: center; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>xrnmoni</h1>
+  <select id="device"></select>
+  <input type="date" id="date" />
+  <span id="status"></span>
+  <span class="spacer"></span>
+  <input id="token" type="password" placeholder="access token" style="width:150px" />
+  <button id="refresh">Refresh</button>
+</header>
+<main>
+  <div class="cards" id="cards"></div>
+  <div class="grid2">
+    <div class="panel"><h2>Top apps</h2><div id="apps"></div></div>
+    <div class="panel"><h2>Top websites</h2><div id="domains"></div></div>
+  </div>
+  <div class="panel">
+    <h2>Timeline (most recent first)</h2>
+    <div id="timeline"></div>
+  </div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const api = (path) =>
+  fetch(path, { headers: { Authorization: "Bearer " + ($("token").value || "") } })
+    .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); });
+
+function fmtDur(s) {
+  s = Math.round(s || 0);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  if (h) return `${h}h ${m}m`;
+  if (m) return `${m}m ${sec}s`;
+  return `${sec}s`;
+}
+function fmtTime(ts) {
+  if (!ts) return "—";
+  return new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+function dayBounds(dateStr) {
+  const d = dateStr ? new Date(dateStr + "T00:00:00") : new Date();
+  const start = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  return { since: start.getTime() / 1000, until: start.getTime() / 1000 + 86400 };
+}
+
+function barRows(items, cls) {
+  if (!items.length) return '<div class="empty">No data</div>';
+  const max = Math.max(...items.map(i => i.seconds || 0), 1);
+  return items.slice(0, 12).map(i => `
+    <div class="bar-row">
+      <div class="name" title="${(i.name || "?").replace(/"/g, "")}">${i.name || "?"}</div>
+      <div class="bar-track"><div class="bar-fill ${cls}" style="width:${Math.max(2, 100 * (i.seconds || 0) / max)}%"></div></div>
+      <div class="num">${fmtDur(i.seconds)}</div>
+    </div>`).join("");
+}
+
+async function loadDevices() {
+  try {
+    const d = await api("/api/devices");
+    const sel = $("device");
+    const cur = sel.value;
+    sel.innerHTML = d.devices.map(dev => {
+      const online = (d.now - dev.last_seen) < 120;
+      return `<option value="${dev.device}">${online ? "● " : "○ "}${dev.device}</option>`;
+    }).join("") || '<option value="">(no devices yet)</option>';
+    if (cur) sel.value = cur;
+    const dev = d.devices.find(x => x.device === sel.value);
+    if (dev) {
+      const online = (d.now - dev.last_seen) < 120;
+      $("status").innerHTML = `<span class="dot ${online ? "online" : "offline"}"></span>` +
+        `${dev.os || "?"} · last seen ${fmtTime(dev.last_seen)}`;
+    }
+  } catch (e) { $("status").textContent = "auth error — check token"; }
+}
+
+async function loadData() {
+  const device = $("device").value;
+  if (!device) return;
+  const { since, until } = dayBounds($("date").value);
+  try {
+    const [s, a] = await Promise.all([
+      api(`/api/summary?device=${encodeURIComponent(device)}&since=${since}&until=${until}`),
+      api(`/api/activity?device=${encodeURIComponent(device)}&since=${since}&until=${until}`),
+    ]);
+    const t = s.totals || {};
+    $("cards").innerHTML = [
+      ["Active (apps)", fmtDur(t.app_seconds)],
+      ["On the web", fmtDur(t.web_seconds)],
+      ["Idle / AFK", fmtDur(t.afk_seconds)],
+      ["First activity", fmtTime(t.first_ts)],
+      ["Last activity", fmtTime(t.last_ts)],
+    ].map(([k, v]) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
+    $("apps").innerHTML = barRows(s.apps, "");
+    $("domains").innerHTML = barRows(s.domains, "web");
+    $("timeline").innerHTML = a.events.length ? `<table>
+      <tr><th>Start</th><th>End</th><th>Type</th><th>What</th><th class="dur">Dur</th></tr>
+      ${a.events.map(e => `<tr>
+        <td>${fmtTime(e.ts_start)}</td>
+        <td>${fmtTime(e.ts_end)}</td>
+        <td><span class="tag ${e.type}">${e.type}</span></td>
+        <td title="${(e.title || e.url || e.app || "").replace(/"/g, "")}">
+          ${e.type === "browser" ? (e.domain || "") + " — " + (e.title || e.url || "") : (e.app || "") + (e.title ? " — " + e.title : "")}
+        </td>
+        <td class="dur">${e.duration != null ? fmtDur(e.duration) : "—"}</td>
+      </tr>`).join("")}
+    </table>` : '<div class="empty">No events for this day</div>';
+  } catch (e) { $("timeline").innerHTML = '<div class="empty">auth error — check token</div>'; }
+}
+
+async function refresh() { await loadDevices(); await loadData(); }
+
+$("token").value = localStorage.getItem("xrnmoni_token") || "";
+$("token").addEventListener("change", () => { localStorage.setItem("xrnmoni_token", $("token").value); refresh(); });
+$("date").value = new Date().toISOString().slice(0, 10);
+$("device").addEventListener("change", loadData);
+$("date").addEventListener("change", loadData);
+$("refresh").addEventListener("click", refresh);
+refresh();
+setInterval(refresh, 30000);
+</script>
+</body>
+</html>

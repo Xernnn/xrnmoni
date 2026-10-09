@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "xrnmoni web tracker",
+  "version": "1.0.0",
+  "description": "Reports active-tab page intervals to the local xrnmoni agent (127.0.0.1).",
+  "permissions": ["tabs", "idle", "alarms", "storage"],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "background": {
+    "service_worker": "background.js"
+  }
+}
