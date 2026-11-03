@@ -44,7 +44,20 @@ XRNMONI_TOKEN="pick-a-long-secret" uvicorn main:app --host 0.0.0.0 --port 8000
 
 The server binds to all interfaces so your other machines can reach it. Keep it
 on a trusted LAN, or tunnel it (Tailscale / WireGuard / SSH) rather than exposing
-port 8000 to the internet. The token is the only access control.
+port 8000 to the internet. The token is the only access control, and it travels in
+plain HTTP, so only send it over a network you trust or one that encrypts (Tailscale
+does). The server won't start without `XRNMONI_TOKEN`, or with `change-me`; use 16 or
+more random characters (`python -c "import secrets; print(secrets.token_urlsafe(24))"`).
+
+## Security
+
+- The dashboard escapes everything agents send (window and page titles are chosen by
+  whatever app or website was open) and runs under a Content-Security-Policy that
+  allows only its own script and requests to this server.
+- The agent's browser bridge (`127.0.0.1:8129`) accepts posts only from a browser
+  extension's origin, so websites you visit can't feed it made-up activity.
+- Tests: `pip install -r server/requirements.txt -r agent/requirements.txt httpx`,
+  then `python -m unittest discover tests`.
 
 ## 2. Agent (on each monitored machine)
 

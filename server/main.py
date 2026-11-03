@@ -2,21 +2,35 @@
 
 Run:
     pip install -r requirements.txt
-    XRNMONI_TOKEN=change-me uvicorn main:app --host 0.0.0.0 --port 8000
+    XRNMONI_TOKEN=<a long random token> uvicorn main:app --host <this machine's Tailscale IP> --port 8000
+
+The server refuses to start without XRNMONI_TOKEN (or with the example's "change-me").
+It speaks plain HTTP, so serve it over Tailscale (which encrypts) or a firewall rule that
+admits only Tailscale, as windows/install.ps1 sets up, never on an open network.
 
 Agents and the dashboard all talk to this one process.
 """
+import base64
+import hashlib
+import hmac
 import os
+import re
+import sys
 import time
 
 from fastapi import FastAPI, Header, HTTPException, Query
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional
 
 import db
 
-TOKEN = os.environ.get("XRNMONI_TOKEN", "change-me")
+TOKEN = os.environ.get("XRNMONI_TOKEN", "").strip()
+if not TOKEN or TOKEN == "change-me":
+    sys.exit("xrnmoni: set XRNMONI_TOKEN to a long random value (not empty, not \"change-me\")")
+if len(TOKEN) < 16:
+    print("xrnmoni: warning: XRNMONI_TOKEN is short; use 16+ random characters", file=sys.stderr)
+EXPECTED_AUTH = f"Bearer {TOKEN}".encode()
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
 app = FastAPI(title="xrnmoni")
@@ -40,9 +54,28 @@ class Batch(BaseModel):
 
 
 def _auth(authorization: Optional[str]):
-    expected = f"Bearer {TOKEN}"
-    if not authorization or authorization != expected:
+    # compare_digest: the time taken doesn't reveal how much of a guess was right
+    if not authorization or not hmac.compare_digest(authorization.encode(), EXPECTED_AUTH):
         raise HTTPException(status_code=401, detail="bad or missing token")
+
+
+def _dashboard_page():
+    """The dashboard, with a CSP that runs only its own inline script (by hash) and lets it
+    talk only to this server, so even a title that slipped past escaping couldn't run code
+    or send the token anywhere."""
+    with open(os.path.join(STATIC_DIR, "dashboard.html"), encoding="utf-8") as f:
+        html = f.read()
+    hashes = " ".join(
+        "'sha256-" + base64.b64encode(hashlib.sha256(m.encode()).digest()).decode() + "'"
+        for m in re.findall(r"<script>(.*?)</script>", html, re.S))
+    csp = ("default-src 'none'; script-src " + hashes + "; style-src 'unsafe-inline'; "
+           "img-src data:; connect-src 'self'; base-uri 'none'; form-action 'none'; "
+           "frame-ancestors 'none'")
+    return html, {"Content-Security-Policy": csp, "X-Content-Type-Options": "nosniff",
+                  "Referrer-Policy": "no-referrer", "Cache-Control": "no-store"}
+
+
+DASHBOARD_HTML, DASHBOARD_HEADERS = _dashboard_page()
 
 
 @app.post("/api/events")
@@ -90,7 +123,7 @@ def activity(
 
 @app.get("/")
 def dashboard():
-    return FileResponse(os.path.join(STATIC_DIR, "dashboard.html"))
+    return HTMLResponse(DASHBOARD_HTML, headers=DASHBOARD_HEADERS)
 
 
 @app.get("/healthz")

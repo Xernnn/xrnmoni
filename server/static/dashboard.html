@@ -81,6 +81,10 @@
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
+// Everything below arrives from agents, and page and window titles are chosen by whatever
+// website or app was open: escape it before it goes into HTML.
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 const api = (path) =>
   fetch(path, { headers: { Authorization: "Bearer " + ($("token").value || "") } })
     .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); });
@@ -107,8 +111,8 @@ function barRows(items, cls) {
   const max = Math.max(...items.map(i => i.seconds || 0), 1);
   return items.slice(0, 12).map(i => `
     <div class="bar-row">
-      <div class="name" title="${(i.name || "?").replace(/"/g, "")}">${i.name || "?"}</div>
-      <div class="bar-track"><div class="bar-fill ${cls}" style="width:${Math.max(2, 100 * (i.seconds || 0) / max)}%"></div></div>
+      <div class="name" title="${esc(i.name || "?")}">${esc(i.name || "?")}</div>
+      <div class="bar-track"><div class="bar-fill ${cls}" style="width:${Math.max(2, 100 * (Number(i.seconds) || 0) / max)}%"></div></div>
       <div class="num">${fmtDur(i.seconds)}</div>
     </div>`).join("");
 }
@@ -120,14 +124,14 @@ async function loadDevices() {
     const cur = sel.value;
     sel.innerHTML = d.devices.map(dev => {
       const online = (d.now - dev.last_seen) < 120;
-      return `<option value="${dev.device}">${online ? "● " : "○ "}${dev.device}</option>`;
+      return `<option value="${esc(dev.device)}">${online ? "● " : "○ "}${esc(dev.device)}</option>`;
     }).join("") || '<option value="">(no devices yet)</option>';
     if (cur) sel.value = cur;
     const dev = d.devices.find(x => x.device === sel.value);
     if (dev) {
       const online = (d.now - dev.last_seen) < 120;
       $("status").innerHTML = `<span class="dot ${online ? "online" : "offline"}"></span>` +
-        `${dev.os || "?"} · last seen ${fmtTime(dev.last_seen)}`;
+        `${esc(dev.os || "?")} · last seen ${fmtTime(dev.last_seen)}`;
     }
   } catch (e) { $("status").textContent = "auth error — check token"; }
 }
@@ -156,9 +160,9 @@ async function loadData() {
       ${a.events.map(e => `<tr>
         <td>${fmtTime(e.ts_start)}</td>
         <td>${fmtTime(e.ts_end)}</td>
-        <td><span class="tag ${e.type}">${e.type}</span></td>
-        <td title="${(e.title || e.url || e.app || "").replace(/"/g, "")}">
-          ${e.type === "browser" ? (e.domain || "") + " — " + (e.title || e.url || "") : (e.app || "") + (e.title ? " — " + e.title : "")}
+        <td><span class="tag ${e.type === "browser" ? "browser" : e.type === "afk" ? "afk" : "app"}">${esc(e.type)}</span></td>
+        <td title="${esc(e.title || e.url || e.app || "")}">
+          ${esc(e.type === "browser" ? (e.domain || "") + " — " + (e.title || e.url || "") : (e.app || "") + (e.title ? " — " + e.title : ""))}
         </td>
         <td class="dur">${e.duration != null ? fmtDur(e.duration) : "—"}</td>
       </tr>`).join("")}

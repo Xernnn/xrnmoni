@@ -19,6 +19,7 @@ import os
 import sys
 import time
 import json
+import re
 import socket
 import threading
 import queue
@@ -112,19 +113,40 @@ class BrowserBridge(ThreadingHTTPServer):
         super().__init__(("127.0.0.1", cfg.bridge_port), _BridgeHandler)
 
 
+# Only our own browser extension may post. Browsers always send the real Origin, and a web
+# page can't claim an extension's, so without this any website you open could feed the
+# agent made-up activity (and, before the dashboard escaped it, script for the dashboard).
+EXTENSION_ORIGIN = re.compile(r"^(chrome-extension|moz-extension)://[A-Za-z0-9._-]+$")
+MAX_BODY = 256 * 1024
+
+
 class _BridgeHandler(BaseHTTPRequestHandler):
+    def _origin_ok(self):
+        return bool(EXTENSION_ORIGIN.match(self.headers.get("Origin", "")))
+
     def _cors(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Origin", self.headers.get("Origin", ""))
         self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Vary", "Origin")
+
+    def _refuse(self, code):
+        self.send_response(code)
+        self.end_headers()
 
     def do_OPTIONS(self):
+        if not self._origin_ok():
+            return self._refuse(403)
         self.send_response(204)
         self._cors()
         self.end_headers()
 
     def do_POST(self):
+        if not self._origin_ok():
+            return self._refuse(403)
         try:
+            if int(self.headers.get("Content-Length", 0)) > MAX_BODY:
+                return self._refuse(413)
             length = int(self.headers.get("Content-Length", 0))
             data = json.loads(self.rfile.read(length) or b"{}")
         except Exception:
