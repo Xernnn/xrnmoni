@@ -1,4 +1,8 @@
-# xrnmoni
+<p align="center">
+  <img src="extension/icons/icon128.png" width="72" height="72" alt="">
+</p>
+
+<h1 align="center">xrnmoni</h1>
 
 Self-hosted activity monitor for **machines you own**. Each machine runs a small
 agent that records which app is in the foreground (and for how long), idle time,
