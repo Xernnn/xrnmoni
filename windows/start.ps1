@@ -26,3 +26,4 @@ if ($agent.Count -gt 0) {
     Write-Host "xrnmoni did not start. See $(Join-Path $XrnLogs 'agent.log') and run status.bat." -ForegroundColor Red
     exit 1
 }
+exit 0

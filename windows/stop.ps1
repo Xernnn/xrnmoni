@@ -15,3 +15,4 @@ else { Write-Host 'xrnmoni was not running.' }
 if (Test-Path -LiteralPath $XrnStartup) {
     Write-Host 'It starts again at the next logon (Startup-folder shortcut); uninstall.ps1 removes that.'
 }
+exit 0

@@ -72,7 +72,7 @@ function Stop-XrnProcesses {
     # Stop the agent politely first: taskkill without /f closes its hidden window, and the
     # agent writes its open interval to the spool and exits. Whatever is left after
     # $TimeoutSec, and the hub (which has no window), is ended outright.
-    param([ValidateSet('agent', 'hub', 'all')] [string]$Role = 'all', [int]$TimeoutSec = 15)
+    param([ValidateSet('agent', 'hub', 'all')] [string]$Role = 'all', [int]$TimeoutSec = 20)
     $procs = @(Get-XrnProcesses -Role $Role)
     if ($procs.Count -eq 0) { return 0 }
     $polite = @($procs | Where-Object { -not (Test-XrnPath ([string]$_.CommandLine) $XrnHubScript) })
@@ -96,6 +96,21 @@ function Get-XrnTasks {
     foreach ($name in @($XrnAgentTask, $XrnHubTask)) {
         Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
     }
+}
+
+function ConvertTo-TomlString([string]$Text) {
+    # A TOML basic string: quote and backslash escaped, control characters as \uXXXX.
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('"')
+    foreach ($ch in $Text.ToCharArray()) {
+        $code = [int]$ch
+        if ($ch -eq [char]'"') { [void]$sb.Append('\"') }
+        elseif ($ch -eq [char]'\') { [void]$sb.Append('\\') }
+        elseif ($code -lt 0x20 -or $code -eq 0x7f) { [void]$sb.Append(('\u{0:X4}' -f $code)) }
+        else { [void]$sb.Append($ch) }
+    }
+    [void]$sb.Append('"')
+    $sb.ToString()
 }
 
 function Read-XrnConfigValue([string]$Key) {

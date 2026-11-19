@@ -34,3 +34,207 @@ jobs:
 
       - name: Tests
         run: python -m unittest discover tests
+
+  windows:
+    # The Windows install end to end on a real Windows, which the test job can't show. The
+    # scripts run under Windows PowerShell 5.1, what Windows 10 and 11 ship. A step's name
+    # says what it proves; windows/ci/check.py prints what it saw. The hub is reached the
+    # way a PC reaches the home server: through a front that strips a /xrnmoni prefix
+    # (windows/ci/hub_proxy.py), with the real hub behind it when server/xrnmoni.py exists.
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      HUB: http://127.0.0.1:5241/xrnmoni
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Every script parses in Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $bad = 0
+          $files = @(Get-ChildItem windows\*.ps1)
+          foreach ($f in $files) {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errors)
+            foreach ($e in $errors) {
+              Write-Host "::error file=windows/$($f.Name),line=$($e.Extent.StartLineNumber)::$($e.Message)"
+              $bad++
+            }
+          }
+          if ($bad) { exit 1 }
+          Write-Host "$($files.Count) scripts parse"
+
+      - name: Win32 backend against the real API, the launcher, the script checks
+        run: |
+          python -m pip install --disable-pip-version-check psutil requests
+          python -m unittest -v tests.test_platform_win tests.test_launcher tests.test_windows_scripts
+
+      - name: Config strings survive TOML (quotes, backslashes, control characters, non-ASCII)
+        shell: powershell
+        run: |
+          . .\windows\common.ps1
+          $nasty = 'a "quoted" C:\dir\ name' + [char]9 + [char]7 + ' ' + [char]0x00F2 + [char]0xD83D + [char]0xDE00
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          [IO.File]::WriteAllText("$env:RUNNER_TEMP\t.toml", "device = $(ConvertTo-TomlString $nasty)`r`n", $utf8)
+          [IO.File]::WriteAllText("$env:RUNNER_TEMP\want.txt", $nasty, $utf8)
+          python windows\ci\check.py toml "$env:RUNNER_TEMP\t.toml" device "$env:RUNNER_TEMP\want.txt"
+
+      - name: A hub behind a front that strips /xrnmoni (the real hub when server/xrnmoni.py is here)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $data = "$env:RUNNER_TEMP\hub"
+          $proxy = @('windows\ci\hub_proxy.py', '--port', '5241', '--prefix', '/xrnmoni',
+                     '--log', "$env:RUNNER_TEMP\hub-requests.jsonl")
+          if (Test-Path server\xrnmoni.py) {
+            python -m pip install --disable-pip-version-check -r server\requirements.txt
+            $token = @(python server\xrnmoni.py token add ci-pc --data $data)[0]
+            $tokenExe = @(python server\xrnmoni.py token add ci-exe --data $data)[0]
+            # console-less, the way install.ps1 -WithHub runs it
+            $pyw = Join-Path (Split-Path (Get-Command python).Source) 'pythonw.exe'
+            Start-Process $pyw -ArgumentList @('server\xrnmoni.py', '--host', '127.0.0.1', '--port', '5240', '--data', $data)
+            $proxy += @('--upstream', 'http://127.0.0.1:5240')
+          } else {
+            Write-Host 'No server\xrnmoni.py on this branch: the front answers as the hub itself.'
+            $token = 'ci-' + [guid]::NewGuid().ToString('N')
+            $tokenExe = $token
+            $proxy += @('--token', $token)
+          }
+          Write-Host "::add-mask::$token"
+          Write-Host "::add-mask::$tokenExe"
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "XRN_TOKEN=$token`nXRN_TOKEN_EXE=$tokenExe`n")
+          Start-Process python -ArgumentList $proxy -WindowStyle Hidden
+          for ($i = 0; $i -lt 30; $i++) {
+            try {
+              if ((Invoke-WebRequest -UseBasicParsing "$env:HUB/healthz").StatusCode -eq 200) { Write-Host "hub answers at $env:HUB/healthz"; exit 0 }
+            } catch {}
+            Start-Sleep 1
+          }
+          Write-Host '::error::the hub did not answer'
+          exit 1
+
+      - name: install.ps1 - Python found by full path, venv, config, logon task, started
+        shell: powershell
+        run: .\windows\install.ps1 -HubUrl $env:HUB -DeviceToken $env:XRN_TOKEN -DeviceName ci-pc
+
+      - name: The logon task is this user's, not elevated, has no time limit, repeats, and started the agent with no console
+        shell: powershell
+        run: |
+          . .\windows\common.ps1
+          $xml = Export-ScheduledTask -TaskName $XrnAgentTask
+          Write-Host $xml
+          $want = @('<LogonTrigger>', '<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>', '<Interval>PT5M</Interval>',
+                    '<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>',
+                    '<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>', '<Count>999</Count>',
+                    "<Command>$XrnPythonw</Command>")
+          $missing = @($want | Where-Object { $xml.IndexOf($_, [StringComparison]::OrdinalIgnoreCase) -lt 0 })
+          # elevated, stored password / S4U (runs without logon), or several copies at once
+          foreach ($bad in @('HighestAvailable', '<LogonType>Password', '<LogonType>S4U', 'Parallel</Multi', 'Queue</Multi', 'StopExisting</Multi')) {
+            if ($xml.IndexOf($bad, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $missing += "no $bad" }
+          }
+          if ($missing.Count) { Write-Host "::error::task XML lacks: $($missing -join ', ')"; exit 1 }
+          $procs = @()
+          for ($i = 0; $i -lt 30 -and $procs.Count -eq 0; $i++) { Start-Sleep 1; $procs = @(Get-XrnProcesses -Role agent) }
+          if ($procs.Count -eq 0) {
+            Get-ScheduledTask -TaskName $XrnAgentTask | Get-ScheduledTaskInfo | Format-List *
+            Write-Host '::error::the logon task did not start the agent'
+            exit 1
+          }
+          $procs | Format-Table ProcessId, ParentProcessId, ExecutablePath, CommandLine -AutoSize -Wrap | Out-String -Width 300 | Write-Host
+          $uacOff = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System').EnableLUA -eq 0
+          $flags = @()
+          if ($uacOff) { Write-Host '::warning::UAC is off on this runner: elevation is not checked'; $flags += '--uac-off' }
+          python windows\ci\check.py processes @($procs | ForEach-Object { $_.ProcessId }) @flags
+
+      - name: The agent's events reach the hub through the /xrnmoni prefix, and the browser bridge feeds it
+        run: |
+          python windows\ci\check.py events "$env:RUNNER_TEMP\hub-requests.jsonl" --device ci-pc --type boot --timeout 60
+          if ($LASTEXITCODE) { exit 1 }
+          python windows\ci\check.py bridge 8129
+          if ($LASTEXITCODE) { exit 1 }
+          python windows\ci\check.py events "$env:RUNNER_TEMP\hub-requests.jsonl" --device ci-pc --type browser --timeout 60
+
+      - name: stop.ps1 closes the agent politely (its shutdown reaches the hub) and leaves another pythonw.exe running
+        shell: powershell
+        run: |
+          . .\windows\common.ps1
+          $pyw = Join-Path (Split-Path (Get-Command python).Source) 'pythonw.exe'
+          $decoy = Start-Process $pyw -ArgumentList '-c', '"import time; time.sleep(900)"' -PassThru
+          $before = [int](python windows\ci\check.py lines "$env:RUNNER_TEMP\hub-requests.jsonl")
+          $out = & .\windows\stop.ps1 *>&1 | Out-String
+          Write-Host $out
+          $fail = @()
+          if ($out -match 'outright') { $fail += 'the agent had to be ended outright' }
+          if (@(Get-XrnProcesses).Count) { $fail += 'xrnmoni processes still run' }
+          if (-not (Get-Process -Id $decoy.Id -ErrorAction SilentlyContinue)) { $fail += 'another pythonw.exe was ended' }
+          if ("$((Get-ScheduledTask -TaskName $XrnAgentTask).State)" -ne 'Disabled') { $fail += 'the task is still on' }
+          if (-not (Select-String -LiteralPath (Join-Path $XrnLogs 'agent.log') -Pattern 'stopping: close' -SimpleMatch -Quiet)) {
+            $fail += 'the hidden window never got the close'
+          }
+          Get-Content (Join-Path $XrnLogs 'agent.log') -Tail 8 | Write-Host
+          if ($fail.Count) { Write-Host "::error::$($fail -join '; ')"; exit 1 }
+          python windows\ci\check.py events "$env:RUNNER_TEMP\hub-requests.jsonl" --device ci-pc --type shutdown --timeout 30 --after $before
+          Stop-Process -Id $decoy.Id
+
+      - name: start.ps1 brings it back; uninstall.ps1 removes tasks, venv and program, keeps settings and logs
+        shell: powershell
+        run: |
+          . .\windows\common.ps1
+          & .\windows\start.ps1
+          if ($LASTEXITCODE) { exit 1 }
+          & .\windows\uninstall.ps1
+          $fail = @()
+          if (@(Get-XrnTasks).Count) { $fail += 'a task is left' }
+          if (@(Get-XrnProcesses).Count) { $fail += 'a process is left' }
+          foreach ($p in @($XrnVenv, $XrnApp)) { if (Test-Path $p) { $fail += "$p is left" } }
+          foreach ($p in @($XrnConfig, $XrnLogs)) { if (-not (Test-Path $p)) { $fail += "$p is gone" } }
+          if ($fail.Count) { Write-Host "::error::$($fail -join '; ')"; exit 1 }
+
+      - name: Build xrnmoni-agent.exe - windowed, CA bundle inside
+        shell: powershell
+        run: |
+          .\windows\build-exe.ps1 -Python (Get-Command python).Source
+          python windows\ci\check.py exe windows\dist\xrnmoni-agent\xrnmoni-agent.exe
+
+      - name: install.ps1 -UseExe from the built package records with no Python, then uninstall -RemoveData
+        shell: powershell
+        run: |
+          . .\windows\common.ps1
+          $before = [int](python windows\ci\check.py lines "$env:RUNNER_TEMP\hub-requests.jsonl")
+          & .\windows\dist\xrnmoni-windows\windows\install.ps1 -UseExe -HubUrl $env:HUB -DeviceToken $env:XRN_TOKEN_EXE -DeviceName ci-exe
+          if ($LASTEXITCODE) { exit 1 }
+          $procs = @(Get-XrnProcesses -Role agent)
+          $procs | Format-Table ProcessId, ExecutablePath, CommandLine -AutoSize -Wrap | Out-String -Width 300 | Write-Host
+          if ($procs.Count -ne 1 -or $procs[0].ExecutablePath -ine $XrnExe) { Write-Host '::error::the task did not start the exe'; exit 1 }
+          if (Test-Path $XrnVenv) { Write-Host '::error::-UseExe left a venv'; exit 1 }
+          python windows\ci\check.py processes $procs[0].ProcessId
+          if ($LASTEXITCODE) { exit 1 }
+          python windows\ci\check.py events "$env:RUNNER_TEMP\hub-requests.jsonl" --device ci-exe --type boot --timeout 60 --after $before
+          if ($LASTEXITCODE) { exit 1 }
+          $out = & .\windows\stop.ps1 *>&1 | Out-String
+          Write-Host $out
+          if ($out -match 'outright') { Write-Host '::error::the exe had to be ended outright'; exit 1 }
+          & .\windows\uninstall.ps1 -RemoveData
+          foreach ($p in @($XrnHome, $XrnConfDir)) { if (Test-Path $p) { Write-Host "::error::$p is left"; exit 1 } }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: xrnmoni-windows
+          path: windows/dist/xrnmoni-windows/
+          if-no-files-found: error
+
+      - name: On failure - logs, tasks, what the hub was sent
+        if: failure()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          . .\windows\common.ps1
+          Get-ChildItem $XrnLogs -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "== $($_.FullName)"; Get-Content $_.FullName -Tail 80 }
+          Write-Host '== hub requests'; Get-Content "$env:RUNNER_TEMP\hub-requests.jsonl" -ErrorAction SilentlyContinue
+          Write-Host '== hub log'; Get-Content "$env:RUNNER_TEMP\hub\xrnmoni.log" -Tail 50 -ErrorAction SilentlyContinue
+          & .\windows\status.ps1

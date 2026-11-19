@@ -58,3 +58,4 @@ if (Test-Path -LiteralPath $logFile) {
 } else {
     Write-Host '  (no log yet)'
 }
+exit 0

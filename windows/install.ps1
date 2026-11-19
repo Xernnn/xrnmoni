@@ -183,20 +183,6 @@ if ($WithHub) {
 
 # --- 4. Config -------------------------------------------------------------------------------
 Step 'Settings'
-function ConvertTo-TomlString([string]$Text) {
-    $sb = New-Object System.Text.StringBuilder
-    [void]$sb.Append('"')
-    foreach ($ch in $Text.ToCharArray()) {
-        $code = [int]$ch
-        if ($ch -eq [char]'"') { [void]$sb.Append('\"') }
-        elseif ($ch -eq [char]'\') { [void]$sb.Append('\\') }
-        elseif ($code -lt 0x20 -or $code -eq 0x7f) { [void]$sb.Append(('\u{0:X4}' -f $code)) }
-        else { [void]$sb.Append($ch) }
-    }
-    [void]$sb.Append('"')
-    $sb.ToString()
-}
-
 function Read-Plain([string]$Prompt, [string]$Default) {
     $shown = $Prompt
     if ($Default) { $shown = "$Prompt [$Default]" }
@@ -342,3 +328,4 @@ if ($WithHub) {
 }
 Write-Host '  Check on it any time with windows\status.bat.'
 if (-not $started) { exit 1 }
+exit 0

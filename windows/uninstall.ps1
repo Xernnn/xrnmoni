@@ -35,3 +35,4 @@ if ($RemoveData) {
     Write-Host "  settings:                $XrnConfig"
     Write-Host "  logs, unsent events, hub: $XrnHome"
 }
+exit 0
