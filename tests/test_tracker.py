@@ -161,7 +161,11 @@ class SignalFlushTest(unittest.TestCase):
         p = subprocess.Popen([sys.executable, "-c", FAKE_MAIN, AGENT, cfg],
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         self.addCleanup(lambda: p.poll() is None and p.kill())
-        self.assertIn("[xrnmoni]", p.stdout.readline())
+        for _ in range(20):  # the sender may log before the banner
+            if "[xrnmoni]" in p.stdout.readline():
+                break
+        else:
+            self.fail("no banner")
         time.sleep(1.5)
         killed_at = time.time()
         p.send_signal(sig)
