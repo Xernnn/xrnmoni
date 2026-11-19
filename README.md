@@ -125,9 +125,22 @@ never holds the server URL or token.
    logs `[bridge] refused chrome-extension://…` once, with the origin to add.
    *Last post* on the options page shows what the agent answered (200 = recorded).
 
-**Firefox** — set `"background": { "scripts": ["background.js"] }` in the
-manifest (MV3 event pages) and load it via `about:debugging` → *This Firefox* →
-*Load Temporary Add-on*. `chrome.*` APIs are available as `browser.*`/`chrome.*`.
+**Zen / Firefox** — the same folder works: the manifest names both a service
+worker (Chromium) and an event-page script (Firefox), and has a fixed add-on id.
+
+- Try it: `about:debugging` → *This Firefox* → *Load Temporary Add-on* → pick
+  `extension/manifest.json` (gone after a restart).
+- Keep it: `python scripts/package-extension.py` writes
+  `dist/xrnmoni-extension-<version>.xpi` (and a `.zip` for Chromium). It is unsigned,
+  so set `xpinstall.signatures.required` to `false` in `about:config` (Zen, Firefox
+  Developer Edition, Nightly and ESR honour it), then drag the `.xpi` onto the
+  browser. A newer version is installed the same way.
+- Then set the secret and add the origin as for Chromium. Firefox's origin is
+  `moz-extension://<uuid>`, different in every profile; the options page shows it.
+
+Tests: `python -m unittest discover tests` covers the manifest and the package;
+with Playwright installed, `tests/test_extension_chromium.py` also loads the
+extension in headless Chromium and checks its posts reach the agent's bridge.
 
 MV3 service workers can be suspended; a 30-second heartbeat chunks long sessions
 so at most ~30s is ever lost on suspension.

@@ -24,3 +24,6 @@ desktop.ini
 .vscode/
 *.swp
 *~
+
+# Packaged extension (scripts/package-extension.py)
+dist/
