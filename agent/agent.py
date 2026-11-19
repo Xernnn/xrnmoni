@@ -17,6 +17,7 @@ Usage:
     python agent.py --config config.toml
 """
 import argparse
+import datetime
 import hashlib
 import hmac
 import math
@@ -473,11 +474,18 @@ CHUNK = 60.0  # the longest interval the agent sends
 AWAY = ("idle", "locked", "sleep")  # no app or page time is counted in these
 
 
+def next_midnight(ts):
+    """The first local midnight after ts (mktime settles DST)."""
+    d = datetime.date.fromtimestamp(ts) + datetime.timedelta(days=1)
+    return time.mktime((d.year, d.month, d.day, 0, 0, 0, 0, 0, -1))
+
+
 def pieces(start, end):
-    """[start, end] cut into consecutive pieces of at most CHUNK seconds."""
+    """[start, end] cut into consecutive pieces of at most CHUNK seconds, and at every
+    local midnight, so each piece belongs to one day and day totals add up."""
     out = []
     while start < end:
-        stop = min(end, start + CHUNK)
+        stop = min(end, start + CHUNK, next_midnight(start))
         out.append((start, stop))
         start = stop
     return out

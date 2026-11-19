@@ -103,8 +103,8 @@ same secret. `device` is the friendly name shown in the dashboard.
 - The foreground window (`app`), idle time (`idle`: no input for `afk_threshold`
   seconds), the locked screen (`locked`) and sleep (`sleep`). One at a time: sleep
   beats locked, locked beats idle, idle beats the window.
-- Intervals are sent as closed chunks of at most 60 s while they last, so a long stay
-  shows up within a minute.
+- Intervals are sent as closed chunks of at most 60 s while they last, and split at
+  local midnight, so a long stay shows up within a minute and day totals add up.
 - Every event goes into a SQLite spool (`spool_path`, default
   `~/.local/state/xrnmoni/spool.sqlite`, `%LOCALAPPDATA%\xrnmoni\` on Windows) when it
   is made, and is deleted only after the server took it. A server outage, a restart or
