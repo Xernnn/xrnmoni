@@ -37,9 +37,14 @@ async function post(interval) {
 
 function now() { return Date.now() / 1000; }
 
+// Each interval gets an id once, so the agent and the server can tell a resend
+// from a new interval.
+function newId() { return crypto.randomUUID().replaceAll("-", ""); }
+
 async function stop(endTs) {
   if (current && endTs > current.start) {
     await post({
+      id: newId(),
       url: current.url,
       title: current.title,
       domain: current.domain,
@@ -88,7 +93,7 @@ async function heartbeat() {
     const t = now();
     const url = current.url, title = current.title, domain = current.domain, start = current.start;
     if (t > start) {
-      await post({ url, title, domain, ts_start: start, ts_end: t, duration: t - start });
+      await post({ id: newId(), url, title, domain, ts_start: start, ts_end: t, duration: t - start });
       current.start = t;
       await saveCurrent();
     }

@@ -17,6 +17,7 @@ Usage:
     python agent.py --config config.toml
 """
 import argparse
+import hashlib
 import os
 import sys
 import time
@@ -25,6 +26,7 @@ import re
 import socket
 import sqlite3
 import threading
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import psutil
@@ -48,6 +50,32 @@ else:
 
 def log(msg):
     print(msg, flush=True)
+
+
+_ID = re.compile(r"[0-9a-f]{32}")
+
+
+def new_id():
+    """An event's id: the server keeps the first event with a given id and ignores
+    resends, so a batch delivered twice (answer lost, crash before the delete) isn't
+    counted twice."""
+    return uuid.uuid4().hex
+
+
+def derived_id(*parts):
+    """The same id for the same parts, shaped like a UUID4 hex."""
+    digest = hashlib.sha256("\x1f".join(map(str, parts)).encode()).digest()
+    return uuid.UUID(bytes=digest[:16], version=4).hex
+
+
+def valid_id(value):
+    return isinstance(value, str) and bool(_ID.fullmatch(value))
+
+
+def boot_event(device, boot_time):
+    # every start reports the same boot; one id per boot keeps it to one row
+    return {"id": derived_id("boot", device, int(boot_time)), "type": "boot",
+            "ts_start": boot_time}
 
 
 def default_spool_path(platform=sys.platform, env=os.environ, home=os.path.expanduser("~")):
@@ -165,6 +193,9 @@ class Sender(threading.Thread):
         self.put_many([event])
 
     def put_many(self, events):
+        for e in events:
+            if not valid_id(e.get("id")):
+                e["id"] = new_id()
         if events:
             self.spool.add(events)
 
@@ -311,6 +342,7 @@ class _BridgeHandler(BaseHTTPRequestHandler):
         for it in items:
             self.server.sender.put(
                 {
+                    "id": it.get("id"),
                     "type": "browser",
                     "url": it.get("url"),
                     "title": it.get("title"),
@@ -402,7 +434,7 @@ def main():
     sender.start()
 
     # report real boot time once
-    sender.put({"type": "boot", "ts_start": psutil.boot_time()})
+    sender.put(boot_event(cfg.device, psutil.boot_time()))
 
     bridge = BrowserBridge(cfg, sender)
     threading.Thread(target=bridge.serve_forever, daemon=True).start()
