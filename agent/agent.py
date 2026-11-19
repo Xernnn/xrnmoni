@@ -83,6 +83,9 @@ def boot_event(device, boot_time):
             "ts_start": boot_time}
 
 
+DEVICE_NAME = re.compile(r"[^\x00-\x1f\x7f]{1,64}")
+
+
 def default_spool_path(platform=sys.platform, env=os.environ, home=os.path.expanduser("~")):
     """Where the outbox lives when the config doesn't say: the per-user state folder."""
     if platform.startswith("win"):
@@ -99,6 +102,11 @@ class Config:
         self.server_url = c["server_url"].rstrip("/")
         self.token = c["token"]
         self.device = c.get("device") or socket.gethostname()
+        if not DEVICE_NAME.fullmatch(self.device):
+            # the server refuses the whole batch for such a name; retried one event at a
+            # time, that would drop every event
+            raise SystemExit(f"xrnmoni: device {self.device!r} must be 1-64 characters "
+                             "with no control characters")
         self.poll_interval = float(c.get("poll_interval", 2.0))
         self.flush_interval = float(c.get("flush_interval", 10.0))
         self.afk_threshold = float(c.get("afk_threshold", 60.0))
