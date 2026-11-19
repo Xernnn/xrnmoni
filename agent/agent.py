@@ -375,20 +375,36 @@ def pieces(start, end):
     return out
 
 
+def elapsed_clock():
+    """Seconds that keep counting while the machine is suspended. Linux's monotonic
+    clock stops during suspend, CLOCK_BOOTTIME doesn't; elsewhere use wall time."""
+    if hasattr(time, "CLOCK_BOOTTIME"):
+        return time.clock_gettime(time.CLOCK_BOOTTIME)
+    return time.time()
+
+
 class Tracker:
     """Samples the foreground window and idle time and turns them into intervals.
 
     The open interval is sent in closed chunks of CHUNK seconds as it goes, so an
     hour in one window shows up minute by minute, and a crash loses at most the
-    current minute. close() ends it at "now" (on shutdown)."""
+    current minute. close() ends it at "now" (on shutdown).
 
-    def __init__(self, cfg, put_many, backend, now=time.time):
+    If the loop wakes to find more wall time gone than it slept (poll_interval + 10 s),
+    the machine was suspended or the agent stopped: the open interval ends where it was
+    last seen and the gap is recorded as "sleep", instead of counting it as app time.
+    A jump of the wall clock alone (the time was set) ends the interval the same way
+    without inventing a sleep."""
+
+    def __init__(self, cfg, put_many, backend, now=time.time, clock=elapsed_clock):
         self.cfg = cfg
         self.put_many = put_many
         self.backend = backend
         self.now = now
+        self.clock = clock
         # the open interval; "start" is where its unsent part begins
         self.cur = None  # {"type", "app", "title", "start"}
+        self.last = None  # (wall, elapsed) at the previous tick
         self.wake = threading.Event()
 
     def _emit(self, cur, end):
@@ -410,8 +426,22 @@ class Tracker:
     def _open(self, kind, start, app=None, title=None):
         self.cur = {"type": kind, "app": app, "title": title, "start": start}
 
+    def _check_gap(self, now, elapsed):
+        if self.last is None:
+            return
+        last_wall, last_elapsed = self.last
+        limit = self.cfg.poll_interval + 10
+        if now - last_wall > limit and elapsed - last_elapsed > limit:
+            self._close(last_wall)
+            self._emit({"type": "sleep", "start": last_wall}, now)
+        elif now - last_wall > limit or now < last_wall:
+            self._close(last_wall)
+
     def tick(self):
         now = self.now()
+        elapsed = self.clock()
+        self._check_gap(now, elapsed)
+        self.last = (now, elapsed)
         cur = self.cur
         try:
             idle = self.backend.get_idle_seconds()

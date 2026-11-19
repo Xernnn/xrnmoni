@@ -81,6 +81,61 @@ class TrackerTest(unittest.TestCase):
         self.assertTrue(all(b - a <= 60 for _, a, b in self.spans()))
 
 
+class GapTest(TrackerTest):
+    """The loop wakes after more wall time than it slept: suspend, or a stopped process."""
+
+    def setUp(self):
+        super().setUp()
+        self.elapsed = Clock(5000.0)  # keeps counting through suspend, unlike the wall clock
+        self.tracker = agent.Tracker(config(poll_interval=2.0), self.events.extend,
+                                     self.backend, now=self.clock, clock=self.elapsed)
+
+    def run_for(self, seconds, step=2.0):
+        end = self.clock.t + seconds
+        while self.clock.t < end:
+            self.tracker.tick()
+            self.clock.t += step
+            self.elapsed.t += step
+
+    def jump(self, wall, elapsed):
+        self.clock.t += wall
+        self.elapsed.t += elapsed
+
+    def test_suspend_is_sleep_not_app_time(self):
+        self.run_for(10)              # last tick at +8
+        self.jump(600, 600)
+        self.run_for(10)
+        self.tracker.close()
+        apps = self.spans("app")
+        self.assertEqual(apps[0], ("app", 0, 8))
+        sleep = self.spans("sleep")
+        self.assertEqual((sleep[0][1], sleep[-1][2]), (8, 610))
+        self.assertTrue(all(b - a <= 60 for _, a, b in sleep))
+        self.assertEqual(sum(b - a for _, a, b in sleep), 602)
+        self.assertEqual(apps[1][1], 610)
+
+    def test_short_delays_are_not_sleep(self):
+        self.run_for(10)
+        self.jump(9, 9)               # poll + 9 s < poll + 10 s
+        self.run_for(4)
+        self.tracker.close()
+        self.assertEqual(self.spans("sleep"), [])
+        self.assertEqual(self.spans("app"), [("app", 0, 23)])
+
+    def test_a_clock_change_is_not_sleep(self):
+        self.run_for(10)
+        self.jump(3600, 2)            # the wall clock was set forward an hour
+        self.run_for(4)
+        self.clock.t -= 7200          # and back two
+        self.run_for(4)
+        self.tracker.close()
+        self.assertEqual(self.spans("sleep"), [])
+        for _, a, b in self.spans():
+            self.assertGreater(b, a)
+        self.assertEqual(self.spans("app")[0], ("app", 0, 8))
+        self.assertLessEqual(sum(b - a for _, a, b in self.spans("app")), 8 + 4 + 4)
+
+
 FAKE_MAIN = textwrap.dedent("""
     import sys, types
     sys.path.insert(0, sys.argv[1])
