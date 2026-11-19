@@ -85,6 +85,11 @@ function Update-PathFromRegistry {
     $env:Path = $parts -join ';'
 }
 
+# The package (build-exe.ps1) has the exe and no agent\agent.py: use the exe without being told.
+if (-not $UseExe -and -not (Test-Path (Join-Path $src 'agent\agent.py')) -and
+    ((Test-Path (Join-Path $src 'xrnmoni-agent\xrnmoni-agent.exe')) -or (Test-Path $XrnExe))) {
+    $UseExe = $true
+}
 $needPython = (-not $UseExe) -or $WithHub
 $python = $null
 if ($needPython) { Step 'Python'; $python = Find-Python }
