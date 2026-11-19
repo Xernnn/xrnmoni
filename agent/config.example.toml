@@ -23,3 +23,13 @@ afk_threshold = 60.0
 
 # Localhost port the browser extension posts to. Match extension config.
 bridge_port = 8129
+
+# Events wait in this SQLite file until the server has them, so restarts and server
+# outages lose nothing. Default: $XDG_STATE_HOME/xrnmoni/spool.sqlite
+# (~/.local/state/...) on Linux, %LOCALAPPDATA%\xrnmoni\spool.sqlite on Windows.
+# spool_path = "~/.local/state/xrnmoni/spool.sqlite"
+
+# While the server is unreachable the spool keeps at most this much; past it the
+# oldest events are dropped first.
+spool_max_days = 30
+spool_max_rows = 200000

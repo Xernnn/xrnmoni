@@ -7,7 +7,9 @@ Tracks:
   * idle / AFK intervals
   * browser page intervals forwarded from the browser extension
 
-Sends everything in small batches to the central server.
+Every event is written to an on-disk spool (SQLite) as soon as it is made, and
+deleted only once the server has taken it, so restarts, crashes and server
+outages lose nothing that was already recorded.
 
 Usage:
     pip install -r requirements.txt
@@ -21,8 +23,8 @@ import time
 import json
 import re
 import socket
+import sqlite3
 import threading
-import queue
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import psutil
@@ -44,6 +46,19 @@ else:
     raise SystemExit(f"unsupported platform: {sys.platform}")
 
 
+def log(msg):
+    print(msg, flush=True)
+
+
+def default_spool_path(platform=sys.platform, env=os.environ, home=os.path.expanduser("~")):
+    """Where the outbox lives when the config doesn't say: the per-user state folder."""
+    if platform.startswith("win"):
+        base = env.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+    else:
+        base = env.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state")
+    return os.path.join(base, "xrnmoni", "spool.sqlite")
+
+
 class Config:
     def __init__(self, path):
         with open(path, "rb") as f:
@@ -55,49 +70,186 @@ class Config:
         self.flush_interval = float(c.get("flush_interval", 10.0))
         self.afk_threshold = float(c.get("afk_threshold", 60.0))
         self.bridge_port = int(c.get("bridge_port", 8129))
+        self.spool_path = os.path.expanduser(c.get("spool_path") or default_spool_path())
+        self.spool_max_days = float(c.get("spool_max_days", 30))
+        self.spool_max_rows = int(c.get("spool_max_rows", 200000))
+
+
+class Spool:
+    """The outbox: a SQLite file holding every event the server hasn't taken yet.
+
+    Events go in the moment they're made and come out only after the server answered
+    2xx for them, so a crash, a reboot or a week without the server loses nothing.
+    The cap (age and row count) drops the oldest first, so a server that is gone for
+    good can't fill the disk."""
+
+    def __init__(self, path, max_rows=200000, max_days=30):
+        self.path = path
+        self.max_rows = max_rows
+        self.max_age = max_days * 86400
+        self._lock = threading.Lock()
+        if path != ":memory:":
+            os.makedirs(os.path.dirname(os.path.abspath(path)), mode=0o700, exist_ok=True)
+        self._db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS outbox ("
+            " seq INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, event TEXT NOT NULL)")
+
+    def add(self, events):
+        rows = [(float(e.get("ts_end") or e.get("ts_start") or time.time()), json.dumps(e))
+                for e in events]
+        with self._lock:
+            self._db.executemany("INSERT INTO outbox (ts, event) VALUES (?, ?)", rows)
+
+    def peek(self, n):
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT seq, event FROM outbox ORDER BY seq LIMIT ?", (n,)).fetchall()
+        return [(seq, json.loads(event)) for seq, event in rows]
+
+    def remove(self, seqs):
+        with self._lock:
+            self._db.executemany("DELETE FROM outbox WHERE seq = ?", [(s,) for s in seqs])
+
+    def trim(self, now=None):
+        """Apply the cap; returns how many events were dropped."""
+        now = time.time() if now is None else now
+        with self._lock:
+            dropped = self._db.execute(
+                "DELETE FROM outbox WHERE ts < ?", (now - self.max_age,)).rowcount
+            over = self._db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0] - self.max_rows
+            if over > 0:
+                dropped += self._db.execute(
+                    "DELETE FROM outbox WHERE seq IN"
+                    " (SELECT seq FROM outbox ORDER BY seq LIMIT ?)", (over,)).rowcount
+        return dropped
+
+    def __len__(self):
+        with self._lock:
+            return self._db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
+
+    def close(self):
+        with self._lock:
+            self._db.close()
+
+
+# Answers that say the request, not the events, is wrong (token, address, rate limit):
+# keep everything and try again later instead of dropping good data.
+KEEP_STATUSES = {401, 403, 404, 405, 407, 408, 409, 425, 429}
 
 
 class Sender(threading.Thread):
-    """Owns the outgoing queue; batches and POSTs to the server with retry."""
+    """Sends the spool to the server in batches, oldest first.
 
-    def __init__(self, cfg):
+    2xx: the batch is deleted (events the server lists as rejected are logged).
+    Other 4xx: each event is retried alone once; the ones still refused are dropped and
+    logged, so one bad event can't hold up everything after it. 5xx, network errors and
+    the statuses in KEEP_STATUSES keep the events and back off exponentially."""
+
+    BATCH = 250
+    MAX_DELAY = 300.0
+
+    def __init__(self, cfg, spool):
         super().__init__(daemon=True)
         self.cfg = cfg
-        self.q = queue.Queue()
-        self._pending = []  # events not yet acknowledged by the server
+        self.spool = spool
+        self.url = f"{cfg.server_url.rstrip('/')}/api/events"
+        self.headers = {"Authorization": f"Bearer {cfg.token}"}
+        self.session = requests.Session()
+        self.timeout = 10
+        self.wake = threading.Event()
+        self.stopping = False
 
     def put(self, event):
-        self.q.put(event)
+        self.put_many([event])
+
+    def put_many(self, events):
+        if events:
+            self.spool.add(events)
+
+    def next_delay(self, failures):
+        return min(self.cfg.flush_interval * 2 ** (failures - 1), self.MAX_DELAY)
+
+    def _post(self, events):
+        """POST events; returns "ok", "keep" or "refused"."""
+        body = {"device": self.cfg.device, "os": OS_NAME, "events": events}
+        try:
+            r = self.session.post(self.url, json=body, headers=self.headers,
+                                  timeout=self.timeout)
+        except requests.RequestException as e:
+            log(f"[sender] server unreachable, {len(self.spool)} events kept ({e})")
+            return "keep"
+        if 200 <= r.status_code < 300:
+            try:
+                reply = r.json()
+            except ValueError:
+                reply = None
+            if not isinstance(reply, dict) or reply.get("ok") is not True:
+                # a proxy or captive portal answered, not the xrnmoni server
+                log(f"[sender] unexpected answer from {self.url}: {r.text[:120]!r}; events kept")
+                return "keep"
+            for rej in reply.get("rejected") or []:
+                log(f"[sender] server rejected an event, dropped: {rej}")
+            return "ok"
+        if r.status_code >= 500 or r.status_code in KEEP_STATUSES:
+            log(f"[sender] server said {r.status_code}: {r.text[:120]}; events kept")
+            return "keep"
+        return "refused"
+
+    def send_once(self):
+        """Send one batch. Returns "empty", "sent" or "retry" (back off)."""
+        batch = self.spool.peek(self.BATCH)
+        if not batch:
+            return "empty"
+        result = self._post([e for _, e in batch])
+        if result == "ok":
+            self.spool.remove([seq for seq, _ in batch])
+            return "sent"
+        if result == "keep":
+            return "retry"
+        for seq, event in batch:
+            result = self._post([event]) if len(batch) > 1 else "refused"
+            if result == "keep":
+                return "retry"
+            if result == "refused":
+                log(f"[sender] server refused an event, dropped: {json.dumps(event)[:200]}")
+            self.spool.remove([seq])
+        return "sent"
 
     def run(self):
-        session = requests.Session()
-        url = f"{self.cfg.server_url}/api/events"
-        headers = {"Authorization": f"Bearer {self.cfg.token}"}
-        while True:
+        failures = 0
+        while not self.stopping:
             try:
-                self._pending.append(self.q.get(timeout=self.cfg.flush_interval))
-            except queue.Empty:
-                pass
-            # drain whatever else is queued
-            while True:
-                try:
-                    self._pending.append(self.q.get_nowait())
-                except queue.Empty:
-                    break
-            if not self._pending:
-                continue
-            body = {"device": self.cfg.device, "os": OS_NAME, "events": self._pending}
-            try:
-                r = session.post(url, json=body, headers=headers, timeout=10)
-                if r.status_code == 200:
-                    self._pending = []
-                else:
-                    print(f"[sender] server said {r.status_code}: {r.text[:120]}", flush=True)
-            except requests.RequestException as e:
-                print(f"[sender] offline, buffering {len(self._pending)} events ({e})", flush=True)
-                # cap buffer so we don't grow forever while the server is down
-                if len(self._pending) > 10000:
-                    self._pending = self._pending[-10000:]
+                dropped = self.spool.trim()
+                if dropped:
+                    log(f"[sender] spool over its cap, dropped the {dropped} oldest events")
+                result = self.send_once()
+            except Exception as e:  # never let the sender thread die quietly
+                log(f"[sender] error: {e!r}")
+                result = "retry"
+            if result == "retry":
+                failures += 1
+                delay = self.next_delay(failures)
+            else:
+                failures = 0
+                delay = 0 if result == "sent" else self.cfg.flush_interval
+            if delay:
+                self.wake.wait(delay)
+                self.wake.clear()
+
+    def stop(self, timeout=5.0):
+        """Try once more to deliver what's left (it stays in the spool if that fails)."""
+        self.stopping = True
+        self.wake.set()
+        if self.is_alive():
+            self.join(timeout)
+        if self.is_alive():  # still waiting on the server; it'll get the rest next start
+            return
+        self.timeout = 3
+        deadline = time.time() + timeout
+        while time.time() < deadline and self.send_once() == "sent":
+            pass
 
 
 class BrowserBridge(ThreadingHTTPServer):
@@ -246,7 +398,7 @@ def main():
     args = ap.parse_args()
     cfg = Config(args.config)
 
-    sender = Sender(cfg)
+    sender = Sender(cfg, Spool(cfg.spool_path, cfg.spool_max_rows, cfg.spool_max_days))
     sender.start()
 
     # report real boot time once
@@ -264,7 +416,7 @@ def main():
         run_tracker(cfg, sender)
     except KeyboardInterrupt:
         sender.put({"type": "shutdown", "ts_start": time.time()})
-        time.sleep(cfg.flush_interval + 2)  # give the sender a chance to flush
+        sender.stop()
 
 
 if __name__ == "__main__":
