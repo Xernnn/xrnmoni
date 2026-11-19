@@ -13,14 +13,16 @@ may not strip that prefix. Standard library only, plus `bcrypt` to read the user
                                       domain, ts_start, ts_end, duration}]}
                                       200 {"ok", "inserted", "duplicates",
                                            "rejected": [{"index", "id", "error"}]}
+    POST   /api/session               with Basic auth and X-Xrn-Client: sets the sign-in cookie
+    DELETE /api/session               signs this browser out, and ends its cookie for good
     GET    /api/devices               each device and when it was last heard from
     GET    /api/activity?since=&until=  the events themselves, newest first
     GET    /api/summary?device=&since=&until=  one device's totals
     HEAD                              any GET above, answered without its body
 
-Every read also takes device=NAME for one device. Times are epoch seconds. Reads need Basic auth
-from a viewer: the users file's first user, and anyone named with --viewer. Device tokens only post
-events.
+Every read also takes device=NAME for one device. Times are epoch seconds. Reads need the sign-in
+cookie with an X-Xrn-Client header, or Basic auth, from a viewer: the users file's first user, and
+anyone named with --viewer. Device tokens only post events.
 
     python3 xrnmoni.py --data DIR [--host 127.0.0.1] [--port 5240] [--users FILE] [--prefix /xrnmoni]
     python3 xrnmoni.py user add|remove|list [NAME] --data DIR [--users FILE]
@@ -47,6 +49,12 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+    import msvcrt
+
 MAX_BODY = 8 * 1024 * 1024  # an agent back after days offline sends what it kept, up to MAX_EVENTS
 MAX_EVENTS = 10000
 MAX_SPAN_S = 7 * 86400  # one event; a laptop asleep over a long weekend is still one
@@ -72,6 +80,9 @@ FAIL_DELAY_S = 2  # after a wrong one, as Radicale does
 MAX_HELD = 8  # wrong logins held for FAIL_DELAY_S at once; any more are answered at once
 FAIL_LIMIT = 10  # different wrong logins from one address within FAIL_WINDOW_S, then 429
 FAIL_WINDOW_S = 15 * 60
+SESSION_COOKIE = "xrn_session"
+SESSION_S = 30 * 86400
+SIGNED_OUT = "signed-out.json"
 USER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 TOKEN = re.compile(r"xrnmoni_([0-9a-f]{8})_([A-Za-z0-9_-]{43})")
 TOKEN_ID = re.compile(r"[0-9a-f]{8}")
@@ -145,6 +156,26 @@ def write_private(path, text):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+def lock_file(fd):
+    if fcntl:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return
+    while True:
+        try:
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)  # tries for 10 seconds, then raises
+            return
+        except OSError:
+            continue
+
+
+def unlock_file(fd):
+    if not fcntl:
+        try:
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
 
 
 def file_stamp(path):
@@ -601,6 +632,25 @@ class Tokens:
         return True
 
 
+def load_session_key(path):
+    """Made on first start by whichever server gets there first; any others sharing the users file
+    read it."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        pass
+    else:
+        with os.fdopen(fd, "wb") as f:
+            f.write(os.urandom(32))
+    for _ in range(50):  # another server may be writing it this very moment
+        with open(path, "rb") as f:
+            key = f.read()
+        if len(key) >= 32:
+            return key
+        time.sleep(0.1)
+    raise SystemExit(f"{path} is too short to sign with")
+
+
 # ---- logins -------------------------------------------------------------------------------------
 
 def read_names(users_path):
@@ -628,11 +678,92 @@ def basic_login(header):
     return user, secret
 
 
+def session_token(cookie_header):
+    """The xrn_session cookie's value in a Cookie header, or ""."""
+    token = ""
+    for part in (cookie_header or "").split(";"):
+        name, _, value = part.strip().partition("=")
+        if name == SESSION_COOKIE:
+            token = value
+    return token
+
+
+def session_cookie(value, max_age, secure=True):
+    # Path=/: other xrn services on the same address share this sign-in when they share the users file.
+    return (f"{SESSION_COOKIE}={value}; Path=/; Max-Age={max_age}; HttpOnly; "
+            f"{'Secure; ' if secure else ''}SameSite=Strict")
+
+
+class SignedOut:
+    """The cookies signed out on any server that shares the users file: signed-out.json, beside it,
+    {sha256 of the cookie: when it would have run out}. The other xrn servers keep the same list
+    with their own copy of this, so signing out here ends the cookie there too."""
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.seen = None
+        self.listed = {}
+
+    def read(self):
+        """The file's list: {} with no file, None (and a line in the log) for one that can't be read."""
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                doc = json.load(f)
+            if not isinstance(doc, dict):
+                raise ValueError("not a JSON object")
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError, RecursionError) as e:
+            log(f"{self.path} can't be read, so the sign-outs read before it hold: {e}")
+            return None
+        return {k: v for k, v in doc.items() if isinstance(k, str) and isinstance(v, (int, float))}
+
+    def hashes(self):
+        try:
+            st = os.stat(self.path)
+            now = (st.st_ino, st.st_mtime_ns, st.st_size)
+        except FileNotFoundError:
+            now = None
+        except OSError as e:
+            now = ("unreadable", e.errno)
+        with self.lock:
+            if now != self.seen:
+                self.seen = now
+                listed = self.read() if now is not None else {}
+                if listed is not None:
+                    self.listed = listed
+            return self.listed
+
+    def add(self, entries):
+        """Puts {sha256: when it runs out} on the list, under a lock on signed-out.json.lock with the
+        file read again inside it, so two servers signing out at once both keep theirs."""
+        lock = os.open(f"{self.path}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            lock_file(lock)
+            listed = self.read()
+            if listed is None:
+                listed = dict(self.listed)
+            now = time.time()
+            kept = {k: v for k, v in {**listed, **entries}.items() if v >= now}
+            write_private(self.path, json.dumps(kept, separators=(",", ":")))
+            st = os.stat(self.path)
+            with self.lock:
+                self.seen, self.listed = (st.st_ino, st.st_mtime_ns, st.st_size), kept
+        finally:
+            unlock_file(lock)
+            os.close(lock)
+
+
 class Login:
-    """Basic auth against an htpasswd file of bcrypt hashes, and the count of wrong logins per address."""
+    """Basic auth against an htpasswd file of bcrypt hashes, the xrn_session cookie made from it,
+    and the count of wrong logins per address."""
 
     def __init__(self, users_path):
         self.users_path = users_path
+        folder = os.path.dirname(os.path.abspath(users_path))
+        self.session_key = load_session_key(os.path.join(folder, "session.key"))
+        self.signed_out = SignedOut(os.path.join(folder, SIGNED_OUT))
         self.cache = {}  # sha256(user:secret) -> (user, expires, users-file mtime)
         self.fail_lock = threading.Lock()
         self.fail_settled = threading.Condition(self.fail_lock)
@@ -688,6 +819,69 @@ class Login:
         except (OSError, ValueError):
             pass
         return None
+
+    def password_tag(self, user):
+        """A fingerprint of [user]'s hash, so a new password ends the old sessions."""
+        try:
+            with open(self.users_path, encoding="utf-8") as f:
+                for line in f:
+                    name, _, hashed = line.strip().partition(":")
+                    if name == user and hashed:
+                        return hashlib.sha256(hashed.encode()).hexdigest()
+        except OSError:
+            pass
+        return None
+
+    def session_mac(self, body, tag):
+        return hmac.new(self.session_key, f"{body}|{tag}".encode(), hashlib.sha256).hexdigest()
+
+    def make_session(self, user):
+        who = base64.urlsafe_b64encode(user.encode()).decode().rstrip("=")
+        tag = self.password_tag(user)
+        expires = int(time.time()) + SESSION_S
+        # Made from the name, the second it runs out and the password alone, a cookie made in the
+        # second another was signed out would be that signed-out cookie: it runs out a second later.
+        listed = self.signed_out.hashes()
+        while True:
+            body = f"{who}.{expires}"
+            token = f"{body}.{self.session_mac(body, tag)}"
+            if hashlib.sha256(token.encode()).hexdigest() not in listed:
+                return token
+            expires += 1
+
+    def check_session(self, cookie_header):
+        """The user a request's cookie names, if it's ours, unexpired, not signed out and the
+        password unchanged."""
+        token = session_token(cookie_header)
+        try:
+            who, expires, mac = token.split(".")
+            user = base64.urlsafe_b64decode(who + "=" * (-len(who) % 4)).decode("utf-8")
+            if int(expires) < time.time():
+                return None
+        except ValueError:
+            return None
+        if hashlib.sha256(token.encode()).hexdigest() in self.signed_out.hashes():
+            return None
+        tag = self.password_tag(user)
+        if tag is None:
+            return None
+        try:
+            return user if hmac.compare_digest(self.session_mac(f"{who}.{expires}", tag), mac) else None
+        except TypeError:
+            return None
+
+    def end_session(self, cookie_header):
+        """Signs out the session a request's cookie carries, for good: refused from then on by every
+        server that shares it, until it would have run out anyway."""
+        user = self.check_session(cookie_header)
+        if not user:
+            return None
+        token = session_token(cookie_header)
+        try:
+            self.signed_out.add({hashlib.sha256(token.encode()).hexdigest(): int(token.split(".")[1])})
+        except OSError as e:
+            log(f"sign-out not kept: {e}")
+        return user
 
     def recent_failures(self, addr, now):
         """This address's wrong logins within FAIL_WINDOW_S. Under fail_lock."""
@@ -969,12 +1163,18 @@ class Handler(BaseHTTPRequestHandler):
         if not user:
             if header:
                 login.hold_wrong_login()
-            self.send(401, "login required", headers={"WWW-Authenticate": 'Basic realm="xrnmoni"'})
+            # The page's own fetch must see a plain 401, not the browser's password box.
+            challenge = {} if self.headers.get("X-Xrn-Client") else {"WWW-Authenticate": 'Basic realm="xrnmoni"'}
+            self.send(401, "login required", headers=challenge)
         return user
 
     def viewer(self):
-        """The signed-in viewer, or None once a refusal has been answered."""
-        user = self.password()
+        """The signed-in viewer, or None once a refusal has been answered. The cookie counts only
+        with X-Xrn-Client, which another site's page can't send."""
+        user = None
+        if not self.headers.get("Authorization") and self.headers.get("X-Xrn-Client"):
+            user = self.app.login.check_session(self.headers.get("Cookie"))
+        user = user or self.password()
         if user and not self.app.is_viewer(user):
             # The users file may be shared with other services and other people.
             self.send(403, "this account can't see the dashboard")
@@ -1003,6 +1203,12 @@ class Handler(BaseHTTPRequestHandler):
             return None, False
         return device, True
 
+    def secure_cookie(self):
+        """Whether the sign-in cookie can be Secure: everywhere but a plain-HTTP connection straight
+        from another machine (a hub on a LAN or tailnet address), where the browser would drop a
+        Secure cookie and the sign-in would never stick. A proxy in front is on loopback."""
+        return self.client_address[0] in ("127.0.0.1", "::1") or self.client_address[0].startswith("127.")
+
     def do_HEAD(self):
         self.do_GET()
 
@@ -1030,6 +1236,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.route()
+        if path == "/api/session":
+            if not self.headers.get("X-Xrn-Client"):
+                return self.send(400, "X-Xrn-Client required")
+            if not self.headers.get("Authorization", "").startswith("Basic "):
+                return self.send(401, "login required")
+            user = self.viewer()
+            if not user:
+                return None
+            cookie = session_cookie(self.app.login.make_session(user), SESSION_S, self.secure_cookie())
+            return self.send(200, json.dumps({"ok": True, "user": user}), JSON, {"Set-Cookie": cookie})
         if path != "/api/events":
             return self.send(404, "not found")
         device, ok = self.device_token()
@@ -1069,6 +1285,13 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(503, "the database can't be written")
         return self.send_json({"ok": True, "inserted": inserted, "duplicates": len(rows) - inserted,
                                "rejected": rejected})
+
+    def do_DELETE(self):
+        if self.route() != "/api/session":
+            return self.send(404, "not found")
+        # Emptying the browser's cookie alone left any copy of it signing in for its full 30 days.
+        self.app.login.end_session(self.headers.get("Cookie"))
+        return self.send(200, '{"ok":true}', JSON, {"Set-Cookie": session_cookie("", 0, self.secure_cookie())})
 
     # -- reads --
 

@@ -575,6 +575,108 @@ class LoginTest(HubTest):
                 self.assertLess(time.monotonic() - start, 5)
 
 
+class SessionTest(HubTest):
+    """The dashboard signs in once with the password and then carries the xrn_session cookie."""
+
+    def sign_in(self, user="alex", password=RIGHT, headers=None):
+        status, body, h = self.call("POST", "/api/session", auth=(user, password),
+                                    headers={"X-Xrn-Client": "xrnmoni", **(headers or {})})
+        cookie = (h.get("Set-Cookie") or "").split(";")[0]
+        return status, cookie, h
+
+    def read_with(self, cookie, client=True):
+        headers = {"Cookie": cookie, **({"X-Xrn-Client": "xrnmoni"} if client else {})}
+        return self.call("GET", "/api/devices", auth=None, headers=headers)
+
+    def test_a_session_is_made_only_from_the_password(self):
+        status, cookie, h = self.sign_in()
+        self.assertEqual(200, status)
+        self.assertTrue(cookie.startswith("xrn_session="))
+        for part in ("HttpOnly", "Secure", "SameSite=Strict", "Path=/", f"Max-Age={srv.SESSION_S}"):
+            self.assertIn(part, h["Set-Cookie"])
+        self.assertEqual(200, self.read_with(cookie)[0])
+        # Not from a cookie (a session would never end), not without the page's header.
+        status, _, h = self.call("POST", "/api/session", auth=None, headers={"Cookie": cookie, "X-Xrn-Client": "x"})
+        self.assertEqual((401, None), (status, h.get("Set-Cookie")))
+        self.assertEqual(400, self.call("POST", "/api/session")[0])
+        self.assertEqual(401, self.sign_in(password="nope")[0])
+
+    def test_the_cookie_counts_only_with_the_pages_header(self):
+        # A form on another site can make the browser send the cookie, but not the header.
+        _, cookie, _ = self.sign_in()
+        status, _, h = self.read_with(cookie, client=False)
+        self.assertEqual(401, status)
+        self.assertIn("Basic", h["WWW-Authenticate"])
+
+    def test_the_pages_own_fetch_sees_a_plain_401(self):
+        status, _, h = self.call("GET", "/api/devices", auth=None, headers={"X-Xrn-Client": "xrnmoni"})
+        self.assertEqual((401, None), (status, h.get("WWW-Authenticate")))
+
+    def test_signing_out_ends_the_cookie_for_good(self):
+        _, cookie, _ = self.sign_in()
+        status, _, h = self.call("DELETE", "/api/session", auth=None, headers={"Cookie": cookie})
+        self.assertEqual(200, status)
+        self.assertIn("Max-Age=0", h["Set-Cookie"])
+        self.assertEqual(401, self.read_with(cookie)[0])  # a copy of it, kept elsewhere
+        with open(os.path.join(self.data, "signed-out.json")) as f:
+            self.assertEqual(1, len(json.load(f)))
+        self.assertEqual(200, self.read_with(self.sign_in()[1])[0])
+
+    def test_a_sign_out_on_another_server_sharing_the_users_file_counts_here(self):
+        _, cookie, _ = self.sign_in()
+        other = srv.Login(self.users)  # another xrn service reading the same users file and key
+        self.assertEqual("alex", other.check_session(cookie))
+        other.end_session(cookie)
+        self.assertEqual(401, self.read_with(cookie)[0])
+        made_there = other.make_session("alex")
+        self.assertEqual(200, self.read_with(f"xrn_session={made_there}")[0])
+
+    def test_a_new_password_ends_every_session(self):
+        import bcrypt
+
+        _, cookie, _ = self.sign_in()
+        with open(self.users) as f:
+            lines = f.read().splitlines()
+        lines[0] = "alex:" + bcrypt.hashpw(b"changed-password", bcrypt.gensalt(4)).decode()
+        with open(self.users, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        self.assertEqual(401, self.read_with(cookie)[0])
+
+    def test_a_cookie_made_up_or_run_out_signs_no_one_in(self):
+        _, cookie, _ = self.sign_in()
+        who, expires, mac = cookie.partition("=")[2].split(".")
+        for bad in (f"{who}.{expires}.{'0' * 64}", f"{who}.{int(expires) + 1}.{mac}", "xrn_session=", "garbage",
+                    f"{base64.urlsafe_b64encode(b'guest').decode().rstrip('=')}.{expires}.{mac}"):
+            self.assertEqual(401, self.read_with(bad if bad.startswith("xrn") else f"xrn_session={bad}")[0], bad)
+        body = f"{who}.{int(time.time()) - 1}"
+        old = f"{body}.{self.app.login.session_mac(body, self.app.login.password_tag('alex'))}"
+        self.assertEqual(401, self.read_with(f"xrn_session={old}")[0])
+
+    def test_someone_who_cant_see_the_dashboard_gets_no_session(self):
+        status, cookie, _ = self.sign_in("guest", GUEST)
+        self.assertEqual((403, ""), (status, cookie))
+        guest = srv.Login(self.users).make_session("guest")  # from another service on the same address
+        self.assertEqual(403, self.read_with(f"xrn_session={guest}")[0])
+
+    def test_a_sign_in_from_another_sites_page_is_refused(self):
+        self.assertEqual(403, self.sign_in(headers={"Sec-Fetch-Site": "cross-site"})[0])
+
+    def test_the_cookie_is_secure_but_where_the_browser_would_drop_it(self):
+        # A hub on a LAN or tailnet address speaks plain HTTP, and a browser keeps no Secure cookie
+        # from that: the sign-in never stuck. Through a proxy on the same machine it is Secure.
+        def secure(addr):
+            return srv.Handler.secure_cookie(type("H", (), {"client_address": (addr, 1)})())
+        self.assertEqual([True, True, False, False],
+                         [secure(a) for a in ("127.0.0.1", "::1", "192.168.1.20", "100.64.0.7")])
+
+
+class ViewerTest(HubTest):
+    viewers = ("guest",)
+
+    def test_someone_named_with_viewer_sees_the_dashboard(self):
+        self.assertEqual(200, self.call("GET", "/api/devices", auth=("guest", GUEST))[0])
+
+
 class ProcessTest(unittest.TestCase):
     """The program as it's run: under pythonw on Windows there is no console at all."""
 
