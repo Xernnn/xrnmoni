@@ -10,7 +10,8 @@
 #   4. registers the task "xrnmoni agent", which starts it at every logon with no window,
 #   5. starts it now.
 # Run it again to update (from a newer copy of the folder) or to change the settings
-# (-Reconfigure). Every question can be answered on the command line instead:
+# (-Reconfigure; -BridgeOrigin <origin> adds a browser's extension). Every question can be
+# answered on the command line instead:
 #
 #   install.ps1 -HubUrl https://hub.example.net/xrnmoni -DeviceToken xrnmoni_... -DeviceName den-pc
 #
@@ -32,6 +33,7 @@ param(
     [string]$HubBind = '127.0.0.1',
     [int]$HubPort = 5240,
     [string]$HubArgs = '',
+    [string[]]$BridgeOrigin,
     [string]$Python,
     [switch]$UseExe,
     [string]$ExePath,
@@ -138,6 +140,14 @@ if (-not $fromInstalled) {
     }
     Write-Host "Copied to $XrnApp"
 }
+# The extension gets a folder of its own that stays put across updates: Chrome and Edge name
+# an unpacked extension after the folder it was loaded from.
+$extSource = Join-Path $src 'extension'
+if ((Test-Path (Join-Path $extSource 'manifest.json')) -and
+    (Resolve-Path $extSource).Path.TrimEnd('\') -ine $XrnExtension.TrimEnd('\')) {
+    if (Test-Path $XrnExtension) { Remove-Item -Recurse -Force $XrnExtension }
+    Copy-Item -Recurse -Path $extSource -Destination $XrnExtension
+}
 if ($WithHub -and -not (Test-Path $XrnHubScript)) { Fail "No server\xrnmoni.py in ${src}, so this copy has no hub." }
 
 if ($UseExe) {
@@ -191,58 +201,70 @@ function Read-Plain([string]$Prompt, [string]$Default) {
     $v.Trim()
 }
 
-$haveConfig = Test-Path -LiteralPath $XrnConfig
-if ($haveConfig -and -not $Reconfigure -and -not $HubUrl -and -not $DeviceToken -and -not $DeviceName) {
-    Write-Host "Keeping $XrnConfig (run with -Reconfigure to change it)."
-} else {
-    if (-not $HubUrl -and $WithHub) { $HubUrl = "http://127.0.0.1:${HubPort}" }
-    if (-not $HubUrl) { $HubUrl = Read-Plain "Hub address (e.g. https://hub.example.net/xrnmoni)" (Read-XrnConfigValue 'server_url') }
-    $uri = $null
-    if (-not $HubUrl -or -not [Uri]::TryCreate($HubUrl, [UriKind]::Absolute, [ref]$uri) -or
-        ($uri.Scheme -ne 'https' -and $uri.Scheme -ne 'http')) {
-        Fail "'$HubUrl' is not an http:// or https:// address."
-    }
-    $HubUrl = $HubUrl.TrimEnd('/')
-    if ($uri.Scheme -eq 'http' -and -not $uri.IsLoopback) {
-        Write-Host ('That address is plain HTTP, so the device token crosses the network unencrypted. ' +
-                    "Use the hub's https:// address if it has one (Tailscale encrypts on its own).") -ForegroundColor Yellow
-    }
-    if (-not $DeviceName) {
-        $current = Read-XrnConfigValue 'device'
-        if (-not $current) { $current = $env:COMPUTERNAME }
-        $DeviceName = Read-Plain 'Name for this PC on the dashboard' $current
-    }
-    if ($WithHub -and -not $DeviceToken) {
-        $r = Invoke-Native $XrnVenvPy @($XrnHubScript, 'token', 'add', $DeviceName, '--data', $XrnHubData)
-        if ($r.Code -ne 0) { Fail "Could not make a device token: $($r.Output)" }
-        $DeviceToken = (($r.Output -split "`n") | Where-Object { $_ -match '^xrnmoni_' } | Select-Object -First 1)
-        Write-Host "Made a device token for '$DeviceName' on this PC's hub."
-    }
-    if (-not $DeviceToken) {
-        $old = Read-XrnConfigValue 'token'
-        $prompt = "Device token for '$DeviceName' (from the hub: xrnmoni.py token add $DeviceName)"
-        if ($old) { $prompt += ' [keep the current one]' }
-        $secure = Read-Host $prompt -AsSecureString
-        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
-        try { $DeviceToken = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr).Trim() }
-        finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
-        if (-not $DeviceToken) { $DeviceToken = $old }
-    }
-    if (-not $DeviceToken) { Fail 'A device token is needed: make one on the hub with  xrnmoni.py token add <name>.' }
-
-    $lines = @(
-        '# Written by windows\install.ps1. Run it again with -Reconfigure to change these;',
-        '# any other setting in agent\config.example.toml can be added below.',
-        "server_url = $(ConvertTo-TomlString $HubUrl)",
-        "token = $(ConvertTo-TomlString $DeviceToken)",
-        "device = $(ConvertTo-TomlString $DeviceName)"
-    )
-    New-Item -ItemType Directory -Force -Path $XrnConfDir | Out-Null
-    # UTF-8 without a byte-order mark: Python's TOML reader refuses one, and Windows
-    # PowerShell's Set-Content would write one (or the ANSI code page) instead.
-    [IO.File]::WriteAllText($XrnConfig, (($lines -join "`r`n") + "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
-    Write-Host "Wrote $XrnConfig"
+# Ask only for what isn't known yet, or for everything with -Reconfigure; what the command
+# line gives wins. Settings added to the file by hand are kept.
+$ask = $Reconfigure -or -not (Test-Path -LiteralPath $XrnConfig)
+$url = Read-XrnConfigValue 'server_url'
+$device = Read-XrnConfigValue 'device'
+$token = Read-XrnConfigValue 'token'
+if ($HubUrl) { $url = $HubUrl }
+elseif ($WithHub -and ($ask -or -not $url)) { $url = "http://127.0.0.1:${HubPort}" }
+elseif ($ask -or -not $url) { $url = Read-Plain 'Hub address (e.g. https://hub.example.net/xrnmoni)' $url }
+$uri = $null
+if (-not $url -or -not [Uri]::TryCreate($url, [UriKind]::Absolute, [ref]$uri) -or
+    ($uri.Scheme -ne 'https' -and $uri.Scheme -ne 'http')) {
+    Fail "'$url' is not an http:// or https:// address."
 }
+$url = $url.TrimEnd('/')
+if ($uri.Scheme -eq 'http' -and -not $uri.IsLoopback) {
+    Write-Host ('That address is plain HTTP, so the device token crosses the network unencrypted. ' +
+                "Use the hub's https:// address if it has one (Tailscale encrypts on its own).") -ForegroundColor Yellow
+}
+if ($DeviceName) { $device = $DeviceName }
+elseif ($ask -or -not $device) {
+    if (-not $device) { $device = $env:COMPUTERNAME }
+    $device = Read-Plain 'Name for this PC on the dashboard' $device
+}
+if ($DeviceToken) { $token = $DeviceToken }
+elseif ($WithHub -and ($ask -or -not $token)) {
+    $r = Invoke-Native $XrnVenvPy @($XrnHubScript, 'token', 'add', $device, '--data', $XrnHubData)
+    if ($r.Code -ne 0) { Fail "Could not make a device token: $($r.Output)" }
+    $token = (($r.Output -split "`n") | Where-Object { $_ -match '^xrnmoni_' } | Select-Object -First 1)
+    Write-Host "Made a device token for '$device' on this PC's hub."
+} elseif ($ask -or -not $token) {
+    $prompt = "Device token for '$device' (on the hub: xrnmoni.py token add $device)"
+    if ($token) { $prompt += ' [Enter keeps the current one]' }
+    $secure = Read-Host $prompt -AsSecureString
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+    try { $typed = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr).Trim() }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+    if ($typed) { $token = $typed }
+}
+if (-not $token) { Fail 'A device token is needed: make one on the hub with  xrnmoni.py token add <name>.' }
+
+# The browser extension posts to the agent on 127.0.0.1 with this secret, and only from the
+# origins listed. Chrome and Edge name an unpacked extension after its folder, so the copy in
+# %LOCALAPPDATA%\xrnmoni\extension has a known origin; Firefox's is random per profile and
+# is added with -BridgeOrigin (the extension's options page shows it).
+$secret = Read-XrnConfigValue 'bridge_secret'
+if (-not $secret) { $secret = New-XrnSecret }
+$origins = New-Object System.Collections.Generic.List[string]
+foreach ($o in @(Read-XrnConfigArray 'bridge_origins') + @($BridgeOrigin)) {
+    if ($o -and -not $origins.Contains($o.Trim())) { $origins.Add($o.Trim()) }
+}
+if (Test-Path -LiteralPath $XrnExtension) {
+    $chromium = 'chrome-extension://' + (Get-UnpackedExtensionId $XrnExtension)
+    if (-not $origins.Contains($chromium)) { $origins.Add($chromium) }
+}
+$values = [ordered]@{
+    server_url = ConvertTo-TomlString $url
+    token = ConvertTo-TomlString $token
+    device = ConvertTo-TomlString $device
+    bridge_secret = ConvertTo-TomlString $secret
+    bridge_origins = '[' + (($origins | ForEach-Object { ConvertTo-TomlString $_ }) -join ', ') + ']'
+}
+Write-XrnConfig $values
+Write-Host "Wrote $XrnConfig"
 
 # --- 5. Start at logon -----------------------------------------------------------------------
 Step 'Start at logon'
@@ -322,6 +344,9 @@ Write-Host "  Hub:     $(Read-XrnConfigValue 'server_url')"
 Write-Host "  Device:  $(Read-XrnConfigValue 'device')"
 Write-Host "  Config:  $XrnConfig"
 Write-Host "  Log:     $(Join-Path $XrnLogs 'agent.log')"
+Write-Host ''
+Write-Host "  Browser extension: load $XrnExtension unpacked (windows\README-WINDOWS.md says how)," -ForegroundColor Cyan
+Write-Host "  then paste this into its options page as the Secret:  $(Read-XrnConfigValue 'bridge_secret')" -ForegroundColor Cyan
 if ($WithHub) {
     Write-Host "  Hub log: $(Join-Path $XrnHubData 'xrnmoni.log')"
     Write-Host "  Sign-in for the dashboard (once):  & `"$XrnVenvPy`" `"$XrnHubScript`" user add <name> --data `"$XrnHubData`""

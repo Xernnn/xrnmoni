@@ -1,4 +1,5 @@
-# Remove xrnmoni for this user: stops it, removes its logon tasks, program and venv.
+# Remove xrnmoni for this user: stops it, removes its logon tasks, program, venv and the
+# extension folder (remove the extension from the browser first).
 # Keeps the settings, logs, unsent events and any hub data, unless -RemoveData.
 #
 #   powershell -ExecutionPolicy Bypass -File uninstall.ps1 [-RemoveData]
@@ -20,7 +21,7 @@ foreach ($t in @(Get-XrnTasks)) {
 }
 if (Test-Path -LiteralPath $XrnStartup) { Remove-Item -LiteralPath $XrnStartup -Force }
 
-$gone = @($XrnApp, $XrnVenv, $XrnBin, $XrnAgentPid)
+$gone = @($XrnApp, $XrnVenv, $XrnBin, $XrnExtension, $XrnAgentPid)
 if ($RemoveData) { $gone = @($XrnHome, $XrnConfDir) }
 foreach ($p in $gone) {
     if (Test-Path -LiteralPath $p) {

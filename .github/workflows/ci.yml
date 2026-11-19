@@ -74,15 +74,25 @@ jobs:
           python -m pip install --disable-pip-version-check psutil requests
           python -m unittest -v tests.test_platform_win tests.test_launcher tests.test_windows_scripts
 
-      - name: Config strings survive TOML (quotes, backslashes, control characters, non-ASCII)
+      - name: config.toml as install.ps1 writes it - odd strings survive, settings added by hand are kept
         shell: powershell
         run: |
           . .\windows\common.ps1
-          $nasty = 'a "quoted" C:\dir\ name' + [char]9 + [char]7 + ' ' + [char]0x00F2 + [char]0xD83D + [char]0xDE00
+          $XrnConfig = "$env:RUNNER_TEMP\c.toml"
           $utf8 = New-Object System.Text.UTF8Encoding($false)
-          [IO.File]::WriteAllText("$env:RUNNER_TEMP\t.toml", "device = $(ConvertTo-TomlString $nasty)`r`n", $utf8)
-          [IO.File]::WriteAllText("$env:RUNNER_TEMP\want.txt", $nasty, $utf8)
-          python windows\ci\check.py toml "$env:RUNNER_TEMP\t.toml" device "$env:RUNNER_TEMP\want.txt"
+          $byHand = "poll_interval = 5.0`r`nbridge_origins = [`r`n  # `"chrome-extension://commented-out`",`r`n  `"moz-extension://kept`",`r`n]`r`n"
+          [IO.File]::WriteAllText($XrnConfig, $byHand, $utf8)
+          $nasty = 'a "quoted" C:\dir\ name' + [char]9 + [char]7 + ' ' + [char]0x00F2 + [char]0xD83D + [char]0xDE00
+          $origins = @(Read-XrnConfigArray 'bridge_origins') + 'chrome-extension://abc'
+          Write-XrnConfig ([ordered]@{
+            device = ConvertTo-TomlString $nasty
+            bridge_origins = '[' + (($origins | ForEach-Object { ConvertTo-TomlString $_ }) -join ', ') + ']'
+          })
+          Get-Content $XrnConfig | Write-Host
+          $want = [ordered]@{ device = $nasty; poll_interval = 5.0; bridge_origins = @('moz-extension://kept', 'chrome-extension://abc') }
+          [IO.File]::WriteAllText("$env:RUNNER_TEMP\want.json", (ConvertTo-Json $want), $utf8)
+          Write-Host "Chrome/Edge origin of an unpacked C:\x\extension: chrome-extension://$(Get-UnpackedExtensionId 'C:\x\extension')"
+          python windows\ci\check.py toml $XrnConfig "$env:RUNNER_TEMP\want.json"
 
       - name: A hub behind a front that strips /xrnmoni (the real hub when server/xrnmoni.py is here)
         shell: powershell
@@ -120,7 +130,9 @@ jobs:
 
       - name: install.ps1 - Python found by full path, venv, config, logon task, started
         shell: powershell
-        run: .\windows\install.ps1 -HubUrl $env:HUB -DeviceToken $env:XRN_TOKEN -DeviceName ci-pc
+        run: >
+          .\windows\install.ps1 -HubUrl $env:HUB -DeviceToken $env:XRN_TOKEN -DeviceName ci-pc
+          -BridgeOrigin chrome-extension://abcdefghijklmnopabcdefghijklmnop
 
       - name: The logon task is this user's, not elevated, has no time limit, repeats, and started the agent with no console
         shell: powershell
@@ -155,7 +167,7 @@ jobs:
         run: |
           python windows\ci\check.py events "$env:RUNNER_TEMP\hub-requests.jsonl" --device ci-pc --type boot --timeout 60
           if ($LASTEXITCODE) { exit 1 }
-          python windows\ci\check.py bridge 8129
+          python windows\ci\check.py bridge "$env:APPDATA\xrnmoni\config.toml"
           if ($LASTEXITCODE) { exit 1 }
           python windows\ci\check.py events "$env:RUNNER_TEMP\hub-requests.jsonl" --device ci-pc --type browser --timeout 60
 

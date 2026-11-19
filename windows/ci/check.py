@@ -4,11 +4,12 @@
         waits until the hub took (200, none rejected) a batch from NAME holding an event of
         that type, through the prefix; --after N ignores the log's first N lines.
     python check.py lines LOG                         prints how many lines LOG has
-    python check.py bridge PORT [--header NAME:VALUE] posts a page as the extension would
+    python check.py bridge CONFIG                     posts a page as the extension would, to
+        the agent's bridge_port with its bridge_secret, from chrome-extension://abcd...
     python check.py processes PID [PID ...] [--uac-off]
         not elevated (unless UAC is off, when nothing can be), no console, GUI exe
     python check.py exe PATH                          windowed exe with its CA bundle
-    python check.py toml FILE KEY EXPECTED_FILE       KEY in FILE is EXPECTED_FILE's text
+    python check.py toml FILE EXPECTED_JSON           FILE has the keys and values in EXPECTED_JSON
 """
 import argparse
 import json
@@ -55,24 +56,30 @@ def lines(a):
     return 0
 
 
+ORIGIN = "chrome-extension://abcdefghijklmnopabcdefghijklmnop"
+
+
 def bridge(a):
+    import tomllib
     import urllib.request
+    with open(a.config, "rb") as f:
+        cfg = tomllib.load(f)
+    port = cfg.get("bridge_port", 8129)
     now = time.time()
     body = json.dumps({"id": os.urandom(16).hex(), "url": "https://example.com/ci?q=1",
                        "title": "CI page", "domain": "example.com", "ts_start": now - 5,
                        "ts_end": now, "duration": 5.0}).encode()
-    req = urllib.request.Request(f"http://127.0.0.1:{a.port}/browser", data=body, method="POST")
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/browser", data=body, method="POST")
     req.add_header("Content-Type", "application/json")
-    req.add_header("Origin", "chrome-extension://abcdefghijklmnopabcdefghijklmnop")
-    for h in a.header:
-        name, _, value = h.partition(":")
-        req.add_header(name.strip(), value.strip())
+    req.add_header("Origin", ORIGIN)
+    req.add_header("X-Xrnmoni-Secret", cfg.get("bridge_secret", ""))
+    print(f"bridge_origins: {cfg.get('bridge_origins')}")
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
-            print(f"bridge on 127.0.0.1:{a.port} answered {r.status}")
+            print(f"bridge on 127.0.0.1:{port} answered {r.status}")
             return 0 if r.status == 200 else 1
     except OSError as e:
-        print(f"bridge on 127.0.0.1:{a.port}: {e}")
+        print(f"bridge on 127.0.0.1:{port}: {e}")
         return 1
 
 
@@ -113,11 +120,15 @@ def exe(a):
 def toml(a):
     import tomllib
     with open(a.file, "rb") as f:
-        got = tomllib.load(f)[a.key]
-    with open(a.expected, encoding="utf-8") as f:
-        want = f.read()
-    print(f"{a.key}: wrote {want!r}, read back {got!r}")
-    return 0 if got == want else 1
+        got = tomllib.load(f)
+    with open(a.expected, encoding="utf-8-sig") as f:
+        want = json.load(f)
+    bad = 0
+    for key, value in want.items():
+        same = got.get(key) == value
+        bad += not same
+        print(f"{key}: {'same' if same else 'DIFFERENT'}: wrote {value!r}, read back {got.get(key)!r}")
+    return 1 if bad else 0
 
 
 def main():
@@ -132,8 +143,7 @@ def main():
     p = sub.add_parser("lines")
     p.add_argument("log")
     p = sub.add_parser("bridge")
-    p.add_argument("port", type=int)
-    p.add_argument("--header", action="append", default=[])
+    p.add_argument("config")
     p = sub.add_parser("processes")
     p.add_argument("pids", type=int, nargs="+")
     p.add_argument("--uac-off", action="store_true")
@@ -141,7 +151,6 @@ def main():
     p.add_argument("path")
     p = sub.add_parser("toml")
     p.add_argument("file")
-    p.add_argument("key")
     p.add_argument("expected")
     a = ap.parse_args()
     return globals()[a.cmd](a)

@@ -16,6 +16,7 @@ $XrnVenvPy    = Join-Path $XrnVenv 'Scripts\python.exe'
 $XrnLauncher  = Join-Path $XrnApp 'windows\launcher.py'
 $XrnHubScript = Join-Path $XrnApp 'server\xrnmoni.py'
 $XrnExe       = Join-Path $XrnBin 'xrnmoni-agent.exe'
+$XrnExtension = Join-Path $XrnHome 'extension'          # load this one unpacked in the browser
 $XrnAgentTask = 'xrnmoni agent'
 $XrnHubTask   = 'xrnmoni hub'
 $XrnStartup   = Join-Path ([Environment]::GetFolderPath('Startup')) 'xrnmoni agent.lnk'
@@ -122,4 +123,58 @@ function Read-XrnConfigValue([string]$Key) {
         }
     }
     $null
+}
+
+function Read-XrnConfigArray([string]$Key) {
+    # The strings in `key = [...]`, on one line or several; commented-out entries don't count.
+    if (-not (Test-Path -LiteralPath $XrnConfig)) { return @() }
+    $text = (([IO.File]::ReadAllLines($XrnConfig)) | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+    $m = [regex]::Match($text, '(?ms)^\s*' + [regex]::Escape($Key) + '\s*=\s*\[(.*?)\]')
+    if (-not $m.Success) { return @() }
+    foreach ($s in [regex]::Matches($m.Groups[1].Value, '"((?:[^"\\]|\\.)*)"')) { [regex]::Unescape($s.Groups[1].Value) }
+}
+
+function Write-XrnConfig($Values) {
+    # Write $Values (key -> TOML value text) at the top of config.toml, in place of their old
+    # lines, and keep every other line, so settings added by hand survive a reinstall.
+    $kept = New-Object System.Collections.Generic.List[string]
+    if (Test-Path -LiteralPath $XrnConfig) {
+        $inArray = $false
+        foreach ($line in [IO.File]::ReadAllLines($XrnConfig)) {
+            if ($inArray) { if ($line -match '\]') { $inArray = $false }; continue }
+            if ($line -match '^\s*#\s*(Written by windows|Settings below this line)') { continue }
+            if ($line -match '^\s*([A-Za-z0-9_-]+)\s*=' -and $Values.Contains($Matches[1])) {
+                if ($line -match '=\s*\[' -and $line -notmatch '\]') { $inArray = $true }
+                continue
+            }
+            $kept.Add($line)
+        }
+    }
+    $out = New-Object System.Collections.Generic.List[string]
+    $out.Add('# Written by windows\install.ps1; run it again (with -Reconfigure to be asked again) to')
+    $out.Add('# change these. Settings below this line, from agent\config.example.toml, are kept.')
+    foreach ($k in $Values.Keys) { $out.Add("$k = $($Values[$k])") }
+    foreach ($line in $kept) { $out.Add($line) }
+    New-Item -ItemType Directory -Force -Path (Split-Path $XrnConfig -Parent) | Out-Null
+    # UTF-8 without a byte-order mark: Python's TOML reader refuses one, and Windows
+    # PowerShell's Set-Content would write one (or the ANSI code page) instead.
+    [IO.File]::WriteAllText($XrnConfig, (($out -join "`r`n") + "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function New-XrnSecret {
+    $bytes = New-Object byte[] 24
+    $rng = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
+    $rng.GetBytes($bytes)
+    [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+}
+
+function Get-UnpackedExtensionId([string]$Path) {
+    # Chrome, Edge and Brave name an extension loaded unpacked after its folder: SHA-256 of the
+    # full path in UTF-16 with the drive letter upper-cased, the first 32 hex digits written
+    # with the letters a-p for 0-f.
+    $p = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    if ($p.Length -ge 2 -and $p[1] -eq ':') { $p = $p.Substring(0, 1).ToUpperInvariant() + $p.Substring(1) }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $hash = $sha.ComputeHash([Text.Encoding]::Unicode.GetBytes($p))
+    -join ($hash[0..15] | ForEach-Object { [string][char](97 + ($_ -shr 4)) + [char](97 + ($_ -band 15)) })
 }

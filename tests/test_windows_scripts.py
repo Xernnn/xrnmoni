@@ -60,7 +60,8 @@ class PowerShellPitfallsTest(unittest.TestCase):
                 if re.search(r"config", line, re.I):
                     self.assertNotRegex(line, r"\b(Set-Content|Out-File|Add-Content)\b",
                                         f"{os.path.basename(path)}:{n}")
-        self.assertIn("UTF8Encoding($false)", read("install.ps1"))
+        self.assertIn("UTF8Encoding($false)", read("common.ps1"))
+        self.assertIn("Write-XrnConfig $values", read("install.ps1"))
 
     @unittest.skipUnless(shutil.which("pwsh"), "pwsh is not installed")
     def test_every_script_parses(self):
@@ -112,6 +113,24 @@ class PerUserInstallTest(unittest.TestCase):
         for param in ("[string]$HubUrl", "[string]$DeviceToken", "[string]$DeviceName"):
             self.assertIn(param, text)
         self.assertIn("-AsSecureString", text)   # the token isn't echoed while typed
+
+
+class BrowserBridgeTest(unittest.TestCase):
+    """The agent takes the extension's posts only with bridge_secret and from bridge_origins,
+    so the installer has to write both, or website time is never recorded."""
+
+    def test_installer_writes_a_secret_and_the_origins(self):
+        text = read("install.ps1")
+        self.assertIn("if (-not $secret) { $secret = New-XrnSecret }", text)
+        self.assertIn("bridge_secret = ConvertTo-TomlString $secret", text)
+        self.assertIn("bridge_origins = '[' +", text)
+        self.assertIn("[string[]]$BridgeOrigin", text)
+
+    def test_extension_is_loaded_from_a_folder_that_stays_put(self):
+        self.assertIn("$XrnExtension = Join-Path $XrnHome 'extension'", read("common.ps1"))
+        text = read("install.ps1")
+        self.assertIn("Copy-Item -Recurse -Path $extSource -Destination $XrnExtension", text)
+        self.assertIn("'chrome-extension://' + (Get-UnpackedExtensionId $XrnExtension)", text)
 
 
 class LogonTaskTest(unittest.TestCase):
@@ -169,7 +188,7 @@ class StopOnlyOurOwnTest(unittest.TestCase):
     def test_uninstall_removes_tasks_program_and_venv_and_data_only_when_asked(self):
         text = read("uninstall.ps1")
         self.assertIn("Unregister-ScheduledTask", text)
-        self.assertIn("$gone = @($XrnApp, $XrnVenv, $XrnBin, $XrnAgentPid)", text)
+        self.assertIn("$gone = @($XrnApp, $XrnVenv, $XrnBin, $XrnExtension, $XrnAgentPid)", text)
         self.assertIn("if ($RemoveData) { $gone = @($XrnHome, $XrnConfDir) }", text)
         self.assertIn("Set-Location $env:TEMP", text)
 
