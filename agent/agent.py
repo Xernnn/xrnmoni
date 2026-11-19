@@ -132,9 +132,10 @@ class Spool:
             "CREATE TABLE IF NOT EXISTS outbox ("
             " seq INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, event TEXT NOT NULL)")
 
-    def add(self, events):
-        rows = [(float(e.get("ts_end") or e.get("ts_start") or time.time()), json.dumps(e))
-                for e in events]
+    def add(self, events, now=None):
+        # the age cap counts from here: how long an event has waited, not how old it is
+        now = time.time() if now is None else now
+        rows = [(now, json.dumps(e)) for e in events]
         with self._lock:
             self._db.executemany("INSERT INTO outbox (ts, event) VALUES (?, ?)", rows)
 
@@ -149,7 +150,8 @@ class Spool:
             self._db.executemany("DELETE FROM outbox WHERE seq = ?", [(s,) for s in seqs])
 
     def trim(self, now=None):
-        """Apply the cap; returns how many events were dropped."""
+        """Apply the cap (spool_max_days unsent, spool_max_rows); returns how many events
+        were dropped."""
         now = time.time() if now is None else now
         with self._lock:
             dropped = self._db.execute(

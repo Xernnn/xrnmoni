@@ -32,10 +32,20 @@ class SpoolTest(unittest.TestCase):
         spool = agent.Spool(self.path, max_rows=3, max_days=30)
         self.addCleanup(spool.close)
         now = time.time()
-        spool.add([ev("too old", now - 31 * 86400)] + [ev(f"e{i}", now) for i in range(5)])
+        spool.add([ev("too old")], now=now - 31 * 86400)
+        spool.add([ev(f"e{i}", now) for i in range(5)], now=now)
         dropped = spool.trim(now)
         self.assertEqual(dropped, 3)
         self.assertEqual([e["title"] for _, e in spool.peek(10)], ["e2", "e3", "e4"])
+
+    def test_the_age_cap_counts_time_waited_not_event_time(self):
+        spool = agent.Spool(self.path, max_rows=100, max_days=30)
+        self.addCleanup(spool.close)
+        now = time.time()
+        # the boot of a machine up for 40 days: old, but it only just went in
+        spool.add([{"type": "boot", "ts_start": now - 40 * 86400}])
+        self.assertEqual(spool.trim(now), 0)
+        self.assertEqual(spool.trim(now + 31 * 86400), 1)  # 31 days unsent: dropped
 
     def test_default_path_follows_the_platform(self):
         self.assertEqual(agent.default_spool_path("linux", {"XDG_STATE_HOME": "/s"}, "/h"),
