@@ -14,6 +14,10 @@
 #
 #   install.ps1 -HubUrl https://hub.example.net/xrnmoni -DeviceToken xrnmoni_... -DeviceName den-pc
 #
+# -UseExe installs xrnmoni-agent.exe (windows\build-exe.ps1, or CI's build) instead of Python
+# and a venv: the PC then needs no Python. It looks for xrnmoni-agent\xrnmoni-agent.exe beside
+# windows\ or in windows\dist\, or takes -ExePath.
+#
 # -WithHub also runs a hub on this PC (python server\xrnmoni.py, listening on 127.0.0.1:5240
 # only; -HubBind <address> to let other machines in, -HubArgs '--insecure-cookie ...' for more
 # of its options) and points the agent at it.
@@ -29,6 +33,8 @@ param(
     [int]$HubPort = 5240,
     [string]$HubArgs = '',
     [string]$Python,
+    [switch]$UseExe,
+    [string]$ExePath,
     [switch]$NoStart
 )
 
@@ -77,9 +83,10 @@ function Update-PathFromRegistry {
     $env:Path = $parts -join ';'
 }
 
-Step 'Python'
-$python = Find-Python
-if (-not $python) {
+$needPython = (-not $UseExe) -or $WithHub
+$python = $null
+if ($needPython) { Step 'Python'; $python = Find-Python }
+if ($needPython -and -not $python) {
     Write-Host 'No Python 3.10 or newer found. Installing Python 3.13 for this user with winget...'
     $r = Invoke-Native 'winget.exe' @('install', '--id', 'Python.Python.3.13', '--exact', '--scope', 'user',
         '--silent', '--accept-package-agreements', '--accept-source-agreements')
@@ -91,12 +98,22 @@ if (-not $python) {
               "(the default 'Install Now' is per user and needs no administrator), then run this again.")
     }
 }
-Write-Host "Using $python"
+if ($python) { Write-Host "Using $python" }
+
+$exeSource = $null
+if ($UseExe) {
+    $tries = @($ExePath, (Join-Path $src 'xrnmoni-agent\xrnmoni-agent.exe'),
+               (Join-Path $PSScriptRoot 'dist\xrnmoni-agent\xrnmoni-agent.exe'), $XrnExe)
+    $exeSource = $tries | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
+    if (-not $exeSource) { Fail 'No xrnmoni-agent.exe found: build it with windows\build-exe.ps1, or pass -ExePath.' }
+}
 
 # --- 2. Program files and venv ---------------------------------------------------------------
 Step 'Program'
-$running = @(Get-XrnProcesses)
-if ($running.Count -gt 0) {
+# An update: turn the tasks off (registering them again below turns them on), or their
+# 5-minute repetition could start the agent again while its files are being replaced.
+foreach ($t in @(Get-XrnTasks)) { Disable-ScheduledTask -TaskName $t.TaskName | Out-Null }
+if (@(Get-XrnProcesses).Count -gt 0) {
     Write-Host 'Stopping the running copy first...'
     Stop-XrnProcesses | Out-Null
 }
@@ -104,9 +121,11 @@ New-Item -ItemType Directory -Force -Path $XrnHome, $XrnLogs | Out-Null
 
 $fromInstalled = (Resolve-Path $src).Path.TrimEnd('\') -ieq $XrnApp.TrimEnd('\')
 if (-not $fromInstalled) {
-    if (-not (Test-Path (Join-Path $src 'agent\agent.py'))) { Fail "No agent\agent.py next to $PSScriptRoot." }
+    $dirs = @('windows')
+    if (-not $UseExe) { $dirs += 'agent' }
+    if (-not $UseExe -and -not (Test-Path (Join-Path $src 'agent\agent.py'))) { Fail "No agent\agent.py next to $PSScriptRoot." }
     if (Test-Path $XrnApp) { Remove-Item -Recurse -Force $XrnApp }
-    foreach ($d in @('agent', 'windows')) {   # their files only: not windows\build, windows\dist
+    foreach ($d in $dirs) {   # their files only: not windows\build, windows\dist
         New-Item -ItemType Directory -Force -Path (Join-Path $XrnApp $d) | Out-Null
         Get-ChildItem -LiteralPath (Join-Path $src $d) -File |
             Where-Object { $_.Name -ne 'config.toml' -and $_.Name -ne 'token.txt' } |
@@ -121,18 +140,34 @@ if (-not $fromInstalled) {
 }
 if ($WithHub -and -not (Test-Path $XrnHubScript)) { Fail "No server\xrnmoni.py in ${src}, so this copy has no hub." }
 
-if ((Test-Path $XrnVenvPy) -and -not (Test-PythonExe $XrnVenvPy)) {
-    Write-Host 'The venv no longer works (its Python was removed or upgraded); making it again.'
-    Remove-Item -Recurse -Force $XrnVenv
+if ($UseExe) {
+    $exeDir = Split-Path $exeSource -Parent     # the exe and its _internal folder
+    if ((Resolve-Path $exeDir).Path.TrimEnd('\') -ine $XrnBin.TrimEnd('\')) {
+        if (Test-Path $XrnBin) { Remove-Item -Recurse -Force $XrnBin }
+        Copy-Item -Recurse -Path $exeDir -Destination $XrnBin
+    }
+    Write-Host "Installed $XrnExe"
+} elseif (Test-Path $XrnBin) {
+    Remove-Item -Recurse -Force $XrnBin        # an earlier -UseExe install
 }
-if (-not (Test-Path $XrnVenvPy)) {
-    & $python -m venv $XrnVenv
-    if ($LASTEXITCODE -ne 0) { Fail "Could not make a venv in $XrnVenv." }
+
+if ($needPython) {
+    if ((Test-Path $XrnVenvPy) -and -not (Test-PythonExe $XrnVenvPy)) {
+        Write-Host 'The venv no longer works (its Python was removed or upgraded); making it again.'
+        Remove-Item -Recurse -Force $XrnVenv
+    }
+    if (-not (Test-Path $XrnVenvPy)) {
+        & $python -m venv $XrnVenv
+        if ($LASTEXITCODE -ne 0) { Fail "Could not make a venv in $XrnVenv." }
+    }
+    $reqs = @()
+    if (-not $UseExe) { $reqs += @('-r', (Join-Path $XrnApp 'agent\requirements.txt')) }
+    if ($WithHub) { $reqs += @('-r', (Join-Path $XrnApp 'server\requirements.txt')) }
+    & $XrnVenvPy -m pip install --disable-pip-version-check --upgrade @reqs
+    if ($LASTEXITCODE -ne 0) { Fail 'Installing the Python packages failed (see above). Is this PC online?' }
+} elseif (Test-Path $XrnVenv) {
+    Remove-Item -Recurse -Force $XrnVenv       # an earlier install without -UseExe
 }
-$reqs = @('-r', (Join-Path $XrnApp 'agent\requirements.txt'))
-if ($WithHub) { $reqs += @('-r', (Join-Path $XrnApp 'server\requirements.txt')) }
-& $XrnVenvPy -m pip install --disable-pip-version-check --upgrade @reqs
-if ($LASTEXITCODE -ne 0) { Fail 'Installing the Python packages failed (see above). Is this PC online?' }
 
 # --- 3. Hub on this PC (optional) ------------------------------------------------------------
 if ($WithHub) {
@@ -260,6 +295,10 @@ if ($oldRule) {
 
 $agentExe = $XrnPythonw
 $agentArgs = "`"$XrnLauncher`" --config `"$XrnConfig`""
+if ($UseExe) {
+    $agentExe = $XrnExe
+    $agentArgs = "--config `"$XrnConfig`""
+}
 $tasks = @()
 try {
     Register-XrnTask $XrnAgentTask $agentExe $agentArgs 'xrnmoni: records which app is in front, for this user.'

@@ -181,5 +181,31 @@ class StopOnlyOurOwnTest(unittest.TestCase):
                     f.read().decode("ascii")
 
 
+class ExeTest(unittest.TestCase):
+    """xrnmoni-agent.exe: the agent with Python inside, so the PC needs none. CI builds it."""
+
+    def test_spec_builds_a_windowed_launcher(self):
+        spec = read("xrnmoni-agent.spec")
+        compile(spec, "xrnmoni-agent.spec", "exec")
+        self.assertIn('[os.path.join(SPECPATH, "launcher.py")]', spec)   # logs, pid, clean stop
+        self.assertIn('pathex=[os.path.join(ROOT, "agent")]', spec)
+        self.assertIn("console=False", spec)
+        self.assertIn('name="xrnmoni-agent"', spec)
+        self.assertIn("COLLECT(", spec)   # one folder: no unpacking to %TEMP%, one process
+
+    def test_build_script_runs_pyinstaller_on_the_spec(self):
+        text = read("build-exe.ps1")
+        self.assertIn("-m PyInstaller", text)
+        self.assertIn("'xrnmoni-agent.spec'", text)
+
+    def test_installer_can_use_the_exe_instead_of_python(self):
+        text = read("install.ps1")
+        self.assertIn("[switch]$UseExe", text)
+        self.assertIn("$needPython = (-not $UseExe) -or $WithHub", text)
+        self.assertIn("$agentExe = $XrnExe", text)
+        self.assertIn("$agentArgs = \"--config `\"$XrnConfig`\"\"", text)
+        self.assertIn("$XrnExe       = Join-Path $XrnBin 'xrnmoni-agent.exe'", read("common.ps1"))
+
+
 if __name__ == "__main__":
     unittest.main()

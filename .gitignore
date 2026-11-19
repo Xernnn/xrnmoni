@@ -24,3 +24,7 @@ desktop.ini
 .vscode/
 *.swp
 *~
+
+# Windows exe build (windows/build-exe.ps1)
+windows/build/
+windows/dist/
