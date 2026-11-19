@@ -4,7 +4,7 @@
 Tracks:
   * boot time (reported once at start)
   * foreground window intervals  -> {app, title, duration}
-  * idle / AFK intervals
+  * idle intervals (no input for afk_threshold seconds)
   * browser page intervals forwarded from the browser extension
 
 Every event is written to an on-disk spool (SQLite) as soon as it is made, and
@@ -450,12 +450,12 @@ class Tracker:
 
         if idle >= self.cfg.afk_threshold:
             # away: the app interval ended when input stopped
-            if not cur or cur["type"] != "afk":
+            if not cur or cur["type"] != "idle":
                 since = now - idle
                 self._close(max(since, cur["start"]) if cur else since)
-                self._open("afk", since)
+                self._open("idle", since)
         else:
-            if cur and cur["type"] == "afk":
+            if cur and cur["type"] == "idle":
                 self._close(now)
                 cur = None
             try:
@@ -505,6 +505,9 @@ def main():
 
     tracker = Tracker(cfg, sender.put_many, backend)
     stop = threading.Event()
+    configure = getattr(backend, "configure", None)
+    if configure:  # Linux: idle threshold for the Wayland notification, wake-ups on changes
+        configure(afk_threshold=cfg.afk_threshold, on_change=tracker.wake.set)
 
     def on_signal(signum, frame):
         stop.set()

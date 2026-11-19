@@ -77,7 +77,7 @@ class TrackerTest(unittest.TestCase):
         self.backend.idle = 60.0
         self.run_for(150)
         kinds = [k for k, _, _ in self.spans()]
-        self.assertGreaterEqual(kinds.count("afk"), 2)
+        self.assertGreaterEqual(kinds.count("idle"), 2)
         self.assertTrue(all(b - a <= 60 for _, a, b in self.spans()))
 
 

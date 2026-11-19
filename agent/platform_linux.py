@@ -2,7 +2,11 @@
 
 Supports two environments, auto-detected:
   * X11        — via python-xlib (EWMH). Idle via `xprintidle` if installed.
-  * Hyprland   — via `hyprctl activewindow -j` (Wayland). Idle not available.
+  * Hyprland   — via `hyprctl activewindow -j` (Wayland).
+
+Idle, first that works: the Wayland ext-idle-notify-v1 protocol (Hyprland, Sway,
+KDE...; a small client below speaks the wire protocol, no dependencies),
+`xprintidle` on X11, logind's IdleHint, else none. Which one is in use is logged.
 
 Other Wayland compositors (GNOME, KDE) don't expose active-window info to
 unprivileged clients without a compositor-specific extension; there we fall
@@ -11,7 +15,11 @@ back to "unknown" and log once. See README for notes.
 import os
 import json
 import shutil
+import socket
+import struct
 import subprocess
+import threading
+import time
 
 NAME = "none"
 
@@ -118,6 +126,253 @@ def _hypr_active_window():
         return None, None
 
 
+# ---- Wayland wire protocol -------------------------------------------------
+# Just enough of it to bind wl_seat and ext_idle_notifier_v1 and hear "idled" /
+# "resumed". Messages are: object id (u32), size << 16 | opcode (u32), arguments;
+# a string is its length with the NUL (u32), the bytes, padding to 4. Native byte
+# order, which is little-endian everywhere this runs.
+WL_DISPLAY = 1
+
+
+class WaylandError(Exception):
+    pass
+
+
+def wl_message(obj, opcode, *args):
+    """Encode one request. int arguments are u32 (uint, object, new_id), str are strings."""
+    body = b""
+    for a in args:
+        if isinstance(a, str):
+            raw = a.encode() + b"\0"
+            body += struct.pack("<I", len(raw)) + raw + b"\0" * (-len(raw) % 4)
+        else:
+            body += struct.pack("<I", a)
+    return struct.pack("<II", obj, (8 + len(body)) << 16 | opcode) + body
+
+
+def wl_split(buf):
+    """Split received bytes into whole messages: ([(obj, opcode, body)], rest)."""
+    out = []
+    while len(buf) >= 8:
+        obj, word = struct.unpack_from("<II", buf)
+        size = word >> 16
+        if size < 8:
+            raise WaylandError(f"bad message size {size}")
+        if len(buf) < size:
+            break
+        out.append((obj, word & 0xFFFF, buf[8:size]))
+        buf = buf[size:]
+    return out, buf
+
+
+def wl_args(body, signature):
+    """Decode a message body: u = uint, i = int, s = string."""
+    out, off = [], 0
+    for kind in signature:
+        if kind == "s":
+            n = struct.unpack_from("<I", body, off)[0]
+            out.append(body[off + 4:off + 4 + n - 1].decode("utf-8", "replace") if n else None)
+            off += 4 + n + (-n % 4)
+        else:
+            out.append(struct.unpack_from("<i" if kind == "i" else "<I", body, off)[0])
+            off += 4
+    return out
+
+
+def wayland_socket_path(env=os.environ):
+    name = env.get("WAYLAND_DISPLAY") or "wayland-0"
+    if os.path.isabs(name):
+        return name
+    return os.path.join(env.get("XDG_RUNTIME_DIR", ""), name)
+
+
+class WaylandIdle:
+    """A Wayland client that asks the compositor to say when the user has been idle
+    for `timeout` seconds (ext_idle_notification_v1 "idled") and when they're back
+    ("resumed"). It only listens: it creates no idle inhibitor, so it never keeps the
+    screen on. The notification follows the compositor's idea of idle, so a playing
+    video that holds an idle inhibitor counts as being there."""
+
+    def __init__(self, timeout, path=None, on_change=None, now=time.time):
+        self.timeout = timeout
+        self.path = path or wayland_socket_path()
+        self.on_change = on_change
+        self.now = now
+        self.idled_at = None      # wall time of the last "idled", None when active
+        self.connected = False
+        self.error = None
+        self._ready = threading.Event()
+        self._sock = None
+        self._next_id = 2
+        self._buf = b""
+
+    def _new_id(self):
+        i, self._next_id = self._next_id, self._next_id + 1
+        return i
+
+    def _send(self, data):
+        self._sock.sendall(data)
+
+    def _read(self):
+        data = self._sock.recv(65536)
+        if not data:
+            raise WaylandError("compositor closed the connection")
+        msgs, self._buf = wl_split(self._buf + data)
+        for obj, opcode, body in msgs:
+            if obj == WL_DISPLAY and opcode == 0:  # wl_display.error
+                _, code, message = wl_args(body, "uus")
+                raise WaylandError(f"protocol error {code}: {message}")
+        return msgs
+
+    def _handshake(self):
+        registry, done = self._new_id(), self._new_id()
+        self._send(wl_message(WL_DISPLAY, 1, registry) + wl_message(WL_DISPLAY, 0, done))
+        globals_ = {}
+        while True:
+            for obj, opcode, body in self._read():
+                if obj == registry and opcode == 0:  # wl_registry.global
+                    name, interface, version = wl_args(body, "usu")
+                    globals_.setdefault(interface, (name, version))
+                elif obj == done and opcode == 0:  # wl_callback.done
+                    return registry, globals_
+
+    def _bind(self, registry, globals_, interface):
+        name, _ = globals_[interface]
+        new = self._new_id()
+        self._send(wl_message(registry, 0, name, interface, 1, new))  # version 1
+        return new
+
+    def connect(self):
+        """Connect and subscribe. Raises WaylandError / OSError when it can't."""
+        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._sock.settimeout(5)
+        self._sock.connect(self.path)
+        registry, globals_ = self._handshake()
+        missing = [i for i in ("wl_seat", "ext_idle_notifier_v1") if i not in globals_]
+        if missing:
+            raise WaylandError("compositor has no " + " or ".join(missing))
+        seat = self._bind(registry, globals_, "wl_seat")
+        notifier = self._bind(registry, globals_, "ext_idle_notifier_v1")
+        self.notification = self._new_id()
+        # ext_idle_notifier_v1.get_idle_notification(id, timeout ms, seat)
+        self._send(wl_message(notifier, 1, self.notification,
+                              max(1, int(self.timeout * 1000)), seat))
+        self._sock.settimeout(None)
+        self.connected = True
+
+    def _handle(self, obj, opcode):
+        if obj != self.notification:
+            return
+        self.idled_at = self.now() if opcode == 0 else None
+        if self.on_change:
+            self.on_change()
+
+    def serve(self):
+        while True:
+            for obj, opcode, _ in self._read():
+                self._handle(obj, opcode)
+
+    def run(self):
+        """Connect, then listen until the connection ends; reconnect after a pause."""
+        while True:
+            try:
+                self.connect()
+                self._ready.set()
+                self.serve()
+            except (OSError, WaylandError, struct.error) as e:
+                self.error = str(e) or type(e).__name__
+            first = not self._ready.is_set()
+            self.connected = False
+            self.idled_at = None
+            if self._sock:
+                self._sock.close()
+            self._sock, self._next_id, self._buf = None, 2, b""
+            self._ready.set()
+            if first:
+                return  # no idle protocol here: let the caller use another source
+            time.sleep(10)
+
+    def start(self, wait=2.0):
+        threading.Thread(target=self.run, daemon=True, name="wayland-idle").start()
+        self._ready.wait(wait)
+        return self.connected
+
+    def idle_seconds(self):
+        idled_at = self.idled_at
+        return 0.0 if idled_at is None else self.now() - idled_at + self.timeout
+
+
+# ---- logind ------------------------------------------------------------------
+def _busctl(*args):
+    """busctl's answer, one value per property asked for."""
+    out = subprocess.run(["busctl", "--json=short", *args], capture_output=True, text=True,
+                         timeout=2)
+    if out.returncode != 0:
+        raise OSError(out.stderr.strip() or "busctl failed")
+    return [json.loads(line)["data"] for line in out.stdout.splitlines() if line.strip()]
+
+
+def logind_session_path():
+    """The user's graphical session (the agent may run outside it, as a user service)."""
+    try:
+        display = _busctl("get-property", "org.freedesktop.login1",
+                          "/org/freedesktop/login1/user/self", "org.freedesktop.login1.User",
+                          "Display")[0]
+        if display and display[1] and display[1] != "/":
+            return display[1]
+    except (OSError, ValueError, KeyError, IndexError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def logind_idle_seconds(session, now=time.time):
+    hint, since = _busctl("get-property", "org.freedesktop.login1", session,
+                          "org.freedesktop.login1.Session", "IdleHint", "IdleSinceHint")
+    if not hint or not since:
+        return 0.0
+    return max(0.0, now() - since / 1e6)
+
+
+# ---- idle source -------------------------------------------------------------
+_IDLE = {"source": None}
+_settings = {"afk_threshold": 60.0, "on_change": None}
+
+
+def configure(afk_threshold=None, on_change=None):
+    """Called by the agent at start: the idle threshold (the Wayland notification is
+    created for it) and a callback for state changes, so the agent can act at once."""
+    if afk_threshold is not None:
+        _settings["afk_threshold"] = float(afk_threshold)
+    _settings["on_change"] = on_change
+    _pick_idle_source()
+
+
+def _pick_idle_source():
+    if _IDLE["source"] is not None:
+        return _IDLE["source"]
+    why = []
+    if os.environ.get("WAYLAND_DISPLAY") and hasattr(socket, "AF_UNIX"):
+        client = WaylandIdle(_settings["afk_threshold"], on_change=_settings["on_change"])
+        if client.start():
+            _IDLE.update(source="wayland", client=client)
+            print(f"[linux] idle: Wayland ext-idle-notify ({_settings['afk_threshold']:g} s)",
+                  flush=True)
+            return "wayland"
+        why.append(f"Wayland: {client.error}")
+    session = shutil.which("busctl") and logind_session_path()
+    if _detect() == "x11" and shutil.which("xprintidle"):
+        _IDLE["source"] = "xprintidle"
+    elif session:
+        _IDLE.update(source="logind", session=session)
+    else:
+        _IDLE["source"] = "none"
+    names = {"xprintidle": "xprintidle", "logind": "logind IdleHint",
+             "none": "none, nothing will be marked idle"}
+    print(f"[linux] idle: {names[_IDLE['source']]}" + (f" ({'; '.join(why)})" if why else ""),
+          flush=True)
+    return _IDLE["source"]
+
+
 # ---- public API ------------------------------------------------------------
 def get_active_window():
     mode = _detect()
@@ -129,8 +384,14 @@ def get_active_window():
 
 
 def get_idle_seconds():
-    mode = _detect()
-    if mode == "x11" and shutil.which("xprintidle"):
+    source = _pick_idle_source()
+    if source == "wayland":
+        return _IDLE["client"].idle_seconds()
+    if source == "xprintidle":
         return _x11_idle()
-    # Hyprland / other Wayland: no portable idle source -> treat as active
+    if source == "logind":
+        try:
+            return logind_idle_seconds(_IDLE["session"])
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+            return 0.0
     return 0.0
