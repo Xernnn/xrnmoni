@@ -58,8 +58,11 @@ more random characters (`python -c "import secrets; print(secrets.token_urlsafe(
 - The dashboard escapes everything agents send (window and page titles are chosen by
   whatever app or website was open) and runs under a Content-Security-Policy that
   allows only its own script and requests to this server.
-- The agent's browser bridge (`127.0.0.1:8129`) accepts posts only from a browser
-  extension's origin, so websites you visit can't feed it made-up activity.
+- The agent's browser bridge (`127.0.0.1:8129`) accepts posts only from the extension
+  origins listed in `bridge_origins` that send the shared `bridge_secret`, so neither
+  websites you visit, other extensions nor other local programs can feed it made-up
+  activity. It checks every field and answers 400 to anything malformed. Page addresses
+  are kept without their `?query` and `#fragment` unless `keep_url_query = true`.
 - Tests: `pip install -r server/requirements.txt -r agent/requirements.txt httpx`,
   then `python -m unittest discover tests`.
 
@@ -115,8 +118,12 @@ never holds the server URL or token.
 
 1. `chrome://extensions` → enable *Developer mode*.
 2. *Load unpacked* → select the `extension/` folder.
-3. If you changed `bridge_port` in the agent config, update `BRIDGE_PORT` in
-   `extension/background.js` to match, then reload the extension.
+3. Open the extension's options: set *Secret* to `bridge_secret` from the agent's
+   config (and *Port* if you changed `bridge_port`), then *Save*.
+4. Add the *Origin* the options page shows (`chrome-extension://…`) to
+   `bridge_origins` in the agent's config and restart the agent. Until then the agent
+   logs `[bridge] refused chrome-extension://…` once, with the origin to add.
+   *Last post* on the options page shows what the agent answered (200 = recorded).
 
 **Firefox** — set `"background": { "scripts": ["background.js"] }` in the
 manifest (MV3 event pages) and load it via `about:debugging` → *This Firefox* →

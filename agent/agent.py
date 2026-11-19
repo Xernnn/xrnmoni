@@ -18,6 +18,8 @@ Usage:
 """
 import argparse
 import hashlib
+import hmac
+import math
 import os
 import sys
 import time
@@ -29,6 +31,7 @@ import sqlite3
 import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit, urlunsplit
 
 import psutil
 import requests
@@ -102,6 +105,9 @@ class Config:
         self.spool_path = os.path.expanduser(c.get("spool_path") or default_spool_path())
         self.spool_max_days = float(c.get("spool_max_days", 30))
         self.spool_max_rows = int(c.get("spool_max_rows", 200000))
+        self.bridge_origins = [str(o) for o in c.get("bridge_origins", [])]
+        self.bridge_secret = str(c.get("bridge_secret", ""))
+        self.keep_url_query = bool(c.get("keep_url_query", False))
 
 
 class Spool:
@@ -289,36 +295,129 @@ class BrowserBridge(ThreadingHTTPServer):
 
     The extension never sees the server URL or token — it only talks to
     127.0.0.1, and we tag + forward. Bound to loopback only.
+
+    A post is taken only from an origin listed in bridge_origins that sends
+    bridge_secret in X-Xrnmoni-Secret. Page time that falls in an idle, locked or
+    sleep interval of the agent is cut out (the tracker passed in knows them).
     """
 
-    def __init__(self, cfg, sender):
+    def __init__(self, cfg, sender, tracker=None):
         self.cfg = cfg
         self.sender = sender
+        self.tracker = tracker
+        self.origins = set(getattr(cfg, "bridge_origins", None) or [])
+        self.secret = getattr(cfg, "bridge_secret", "") or ""
+        self.keep_query = bool(getattr(cfg, "keep_url_query", False))
+        self.logged = set()
         super().__init__(("127.0.0.1", cfg.bridge_port), _BridgeHandler)
+
+    def log_once(self, key, msg):
+        if key not in self.logged and len(self.logged) < 50:
+            self.logged.add(key)
+            log(msg)
 
 
 # Only our own browser extension may post. Browsers always send the real Origin, and a web
 # page can't claim an extension's, so without this any website you open could feed the
 # agent made-up activity (and, before the dashboard escaped it, script for the dashboard).
+# The origin must also be one listed in bridge_origins, so another extension can't post,
+# and the shared secret keeps out local programs, which can send any Origin they like.
 EXTENSION_ORIGIN = re.compile(r"^(chrome-extension|moz-extension)://[A-Za-z0-9._-]+$")
+SECRET_HEADER = "X-Xrnmoni-Secret"
 MAX_BODY = 256 * 1024
+MAX_ITEMS = 100
+MAX_SPAN = 86400.0
+EARLIEST = 946684800.0  # 2000-01-01
+
+
+def _number(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def clean_url(url, keep_query=False):
+    """Drop user:password@ always, and the ?query and #fragment unless keep_query: they
+    carry search terms, session tokens and message ids, not which site it was."""
+    parts = urlsplit(url)
+    netloc = parts.netloc.rpartition("@")[2]
+    if keep_query:
+        return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
+def browser_item(it, now, keep_query=False):
+    """Check one posted interval; returns the event, or raises ValueError."""
+    if not isinstance(it, dict):
+        raise ValueError("an interval must be an object")
+    start, end = it.get("ts_start"), it.get("ts_end")
+    if not (_number(start) and _number(end)):
+        raise ValueError("ts_start and ts_end must be numbers")
+    if not EARLIEST <= start <= end <= now + 300 or end - start > MAX_SPAN:
+        raise ValueError("ts_start/ts_end out of range")
+    url, title = it.get("url"), it.get("title")
+    if url is not None and (not isinstance(url, str) or len(url) > 8192):
+        raise ValueError("url must be a string")
+    if title is not None and not isinstance(title, str):
+        raise ValueError("title must be a string")
+    domain = None
+    if url:
+        url = clean_url(url, keep_query)
+        domain = (urlsplit(url).hostname or "").lower() or None
+    return {"id": it.get("id") if valid_id(it.get("id")) else new_id(), "type": "browser",
+            "url": url, "title": (title or "")[:1000], "domain": domain,
+            "ts_start": float(start), "ts_end": float(end)}
+
+
+def subtract(start, end, periods):
+    """[start, end] minus the (from, to) periods, as a list of (a, b)."""
+    out = [(start, end)]
+    for p0, p1 in periods:
+        out = [piece for a, b in out
+               for piece in ((a, min(b, p0)), (max(a, p1), b)) if piece[1] > piece[0]]
+    return out
 
 
 class _BridgeHandler(BaseHTTPRequestHandler):
+    def _origin(self):
+        return self.headers.get("Origin", "")
+
     def _origin_ok(self):
-        return bool(EXTENSION_ORIGIN.match(self.headers.get("Origin", "")))
+        origin = self._origin()
+        if not EXTENSION_ORIGIN.match(origin):
+            return False
+        if origin not in self.server.origins:
+            self.server.log_once(origin, f"[bridge] refused {origin}: if that is the xrnmoni "
+                                         "extension, add it to bridge_origins in the config")
+            return False
+        return True
+
+    def _secret_ok(self):
+        secret = self.server.secret
+        given = self.headers.get(SECRET_HEADER, "")
+        if secret and hmac.compare_digest(given.encode(), secret.encode()):
+            return True
+        self.server.log_once(("secret", self._origin()),
+                             f"[bridge] {self._origin()} sent no or the wrong {SECRET_HEADER};"
+                             " set the extension's secret to bridge_secret from the config")
+        return False
 
     def _cors(self):
-        self.send_header("Access-Control-Allow-Origin", self.headers.get("Origin", ""))
+        self.send_header("Access-Control-Allow-Origin", self._origin())
         self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, " + SECRET_HEADER)
         self.send_header("Vary", "Origin")
 
-    def _refuse(self, code):
+    def _refuse(self, code, cors=False, msg=None):
         self.send_response(code)
+        if cors:
+            self._cors()
+        body = json.dumps({"ok": False, "error": msg}).encode() if msg else b""
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
+        self.wfile.write(body)
 
     def do_OPTIONS(self):
+        if self.path != "/browser":
+            return self._refuse(404)
         if not self._origin_ok():
             return self._refuse(403)
         self.send_response(204)
@@ -326,43 +425,52 @@ class _BridgeHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
-        if not self._origin_ok():
+        if self.path != "/browser":
+            return self._refuse(404)
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            return self._refuse(400)
+        if length > MAX_BODY:
+            return self._refuse(413)
+        if not self._origin_ok() or not self._secret_ok():
             return self._refuse(403)
         try:
-            if int(self.headers.get("Content-Length", 0)) > MAX_BODY:
-                return self._refuse(413)
-            length = int(self.headers.get("Content-Length", 0))
-            data = json.loads(self.rfile.read(length) or b"{}")
-        except Exception:
-            self.send_response(400)
-            self._cors()
-            self.end_headers()
-            return
-        # one interval, or a list of them
-        items = data if isinstance(data, list) else [data]
-        for it in items:
-            self.server.sender.put(
-                {
-                    "id": it.get("id"),
-                    "type": "browser",
-                    "url": it.get("url"),
-                    "title": it.get("title"),
-                    "domain": it.get("domain"),
-                    "ts_start": it.get("ts_start"),
-                    "ts_end": it.get("ts_end"),
-                    "duration": it.get("duration"),
-                }
-            )
+            data = json.loads(self.rfile.read(length) or b"null",
+                              parse_constant=lambda c: float("nan"))
+            # one interval, or a list of them
+            items = data if isinstance(data, list) else [data]
+            if not items or len(items) > MAX_ITEMS:
+                raise ValueError(f"send 1 to {MAX_ITEMS} intervals")
+            now = time.time()
+            events = [browser_item(it, now, self.server.keep_query) for it in items]
+        except (ValueError, TypeError, RecursionError) as e:
+            return self._refuse(400, cors=True, msg=str(e)[:200])
+        n = 0
+        tracker = self.server.tracker
+        for e in events:
+            away = tracker.away_periods(e["ts_start"]) if tracker else []
+            kept = subtract(e["ts_start"], e["ts_end"], away)
+            parts = [p for a, b in kept for p in pieces(a, b)]
+            for i, (a, b) in enumerate(parts):
+                piece = dict(e, ts_start=a, ts_end=b, duration=b - a)
+                if parts != [(e["ts_start"], e["ts_end"])]:
+                    piece["id"] = derived_id(e["id"], i)
+                self.server.sender.put(piece)
+                n += 1
+        body = json.dumps({"ok": True, "accepted": n}).encode()
         self.send_response(200)
         self._cors()
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(b'{"ok":true}')
+        self.wfile.write(body)
 
     def log_message(self, *a):  # silence per-request logging
         pass
 
 
 CHUNK = 60.0  # the longest interval the agent sends
+AWAY = ("idle", "locked", "sleep")  # no app or page time is counted in these
 
 
 def pieces(start, end):
@@ -407,6 +515,8 @@ class Tracker:
         self.cur = None  # {"type", "app", "title", "start"}
         self.last = None  # (wall, elapsed) at the previous tick
         self.wake = threading.Event()
+        self._away = []   # closed (start, end) idle/locked/sleep periods, last day
+        self._lock = threading.Lock()
 
     def _emit(self, cur, end):
         events = []
@@ -420,12 +530,27 @@ class Tracker:
             self.put_many(events)
 
     def _close(self, end):
-        cur, self.cur = self.cur, None
+        with self._lock:
+            cur, self.cur = self.cur, None
+            if cur and cur["type"] in AWAY and end > cur["since"]:
+                self._away = [p for p in self._away if p[1] > end - 86400]
+                self._away.append((cur["since"], end))
         if cur and end > cur["start"]:
             self._emit(cur, end)
 
     def _open(self, kind, start, app=None, title=None):
-        self.cur = {"type": kind, "app": app, "title": title, "start": start}
+        with self._lock:
+            self.cur = {"type": kind, "app": app, "title": title, "start": start,
+                        "since": start}
+
+    def away_periods(self, after):
+        """Idle, locked and sleep periods ending after `after`, the open one included
+        (to infinity): the bridge cuts browser time that falls in them."""
+        with self._lock:
+            periods = [p for p in self._away if p[1] > after]
+            if self.cur and self.cur["type"] in AWAY:
+                periods.append((self.cur["since"], math.inf))
+        return periods
 
     def _check_gap(self, now, elapsed):
         if self.last is None:
@@ -436,7 +561,8 @@ class Tracker:
             return  # logind said we were going to sleep; that interval covers the gap
         if now - last_wall > limit and elapsed - last_elapsed > limit:
             self._close(last_wall)
-            self._emit({"type": "sleep", "start": last_wall}, now)
+            self._open("sleep", last_wall)
+            self._close(now)
         elif now - last_wall > limit or now < last_wall:
             self._close(last_wall)
 
@@ -520,10 +646,12 @@ def main():
     # report real boot time once
     sender.put(boot_event(cfg.device, psutil.boot_time()))
 
-    bridge = BrowserBridge(cfg, sender)
-    threading.Thread(target=bridge.serve_forever, daemon=True).start()
-
     tracker = Tracker(cfg, sender.put_many, backend)
+    bridge = BrowserBridge(cfg, sender, tracker)
+    threading.Thread(target=bridge.serve_forever, daemon=True).start()
+    if not cfg.bridge_secret:
+        log("[bridge] bridge_secret is not set in the config: the browser extension's "
+            "posts will be refused")
     stop = threading.Event()
     configure = getattr(backend, "configure", None)
     if configure:  # Linux: idle threshold for the Wayland notification, wake-ups on changes
