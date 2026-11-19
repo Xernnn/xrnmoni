@@ -1,5 +1,4 @@
 @echo off
-REM Double-click to stop xrnmoni (both server and tracker).
-taskkill /f /im pythonw.exe >nul 2>&1
-echo xrnmoni stopped.
-timeout /t 2 >nul
+REM Double-click to stop xrnmoni until start-xrnmoni.bat starts it again.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0stop.ps1"
+timeout /t 5 >nul

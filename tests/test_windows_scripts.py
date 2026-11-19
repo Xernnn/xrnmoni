@@ -138,5 +138,48 @@ class LogonTaskTest(unittest.TestCase):
         self.assertNotRegex(self.task, r"(?i)-Execute\s+['\"]?powershell")
 
 
+class StopOnlyOurOwnTest(unittest.TestCase):
+    """stop and uninstall end xrnmoni's processes and nothing else."""
+
+    def test_never_by_image_name(self):
+        # `taskkill /f /im pythonw.exe` ended every Python program on the PC.
+        for path in scripts("*.ps1", "*.bat"):
+            text = "".join(line for _, line in code_lines(path))
+            with self.subTest(script=os.path.basename(path)):
+                self.assertNotRegex(text, r"(?i)taskkill[^\n]*/im\b")
+                self.assertNotRegex(text, r"(?i)Stop-Process\s+-Name|Get-Process\s+[\w*]*python[^\n]*\|\s*Stop-Process")
+
+    def test_processes_are_ours_by_exact_path(self):
+        common = read("common.ps1")
+        body = common[common.index("function Get-XrnProcesses"):common.index("function Test-SameProcess")]
+        self.assertIn("$exe -ieq $XrnExe", body)
+        self.assertIn("Test-XrnPath $cmd $XrnLauncher", body)
+        self.assertIn("Test-XrnPath $cmd $XrnHubScript", body)
+        stop = common[common.index("function Stop-XrnProcesses"):]
+        self.assertIn("'taskkill.exe' @('/pid'", stop)          # politely, by id
+        self.assertIn("if (Test-SameProcess $p)", stop)         # never a reused id
+        for name in ("stop.ps1", "uninstall.ps1"):
+            self.assertIn("Stop-XrnProcesses", read(name))
+
+    def test_stop_keeps_the_task_from_starting_it_again(self):
+        text = read("stop.ps1")
+        self.assertLess(text.index("Disable-ScheduledTask"), text.index("Stop-XrnProcesses"))
+        self.assertIn("Enable-ScheduledTask", read("start.ps1"))
+
+    def test_uninstall_removes_tasks_program_and_venv_and_data_only_when_asked(self):
+        text = read("uninstall.ps1")
+        self.assertIn("Unregister-ScheduledTask", text)
+        self.assertIn("$gone = @($XrnApp, $XrnVenv, $XrnBin, $XrnAgentPid)", text)
+        self.assertIn("if ($RemoveData) { $gone = @($XrnHome, $XrnConfDir) }", text)
+        self.assertIn("Set-Location $env:TEMP", text)
+
+    def test_scripts_are_ascii(self):
+        # Windows PowerShell 5.1 reads a script without a BOM in the ANSI code page.
+        for path in scripts("*.ps1", "*.bat"):
+            with self.subTest(script=os.path.basename(path)):
+                with open(path, "rb") as f:
+                    f.read().decode("ascii")
+
+
 if __name__ == "__main__":
     unittest.main()
