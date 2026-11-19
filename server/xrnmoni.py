@@ -1,0 +1,1295 @@
+#!/usr/bin/env python3
+"""xrnmoni hub: keeps what every device's agent reports, and serves the dashboard.
+
+Each monitored machine runs agent/agent.py, which posts here what was in the foreground, when the
+machine was idle, locked or asleep, and the browser extension's pages. One hub holds every device.
+It runs anywhere Python 3.10+ and `bcrypt` do (Linux, Windows, Termux on a phone): on its own
+address, or behind an HTTPS reverse proxy that publishes it under a path (/xrnmoni), which may or
+may not strip that prefix. Standard library only, plus `bcrypt` to read the users file.
+
+    GET    /health, /healthz          200, no login (for monitoring)
+    POST   /api/events                an agent's batch; Authorization: Bearer <device token>
+                                      {"device", "os", "events": [{id, type, app, title, url,
+                                      domain, ts_start, ts_end, duration}]}
+                                      200 {"ok", "inserted", "duplicates",
+                                           "rejected": [{"index", "id", "error"}]}
+    GET    /api/devices               each device and when it was last heard from
+    GET    /api/activity?since=&until=  the events themselves, newest first
+    GET    /api/summary?device=&since=&until=  one device's totals
+    HEAD                              any GET above, answered without its body
+
+Every read also takes device=NAME for one device. Times are epoch seconds. Reads need Basic auth
+from a viewer: the users file's first user, and anyone named with --viewer. Device tokens only post
+events.
+
+    python3 xrnmoni.py --data DIR [--host 127.0.0.1] [--port 5240] [--users FILE] [--prefix /xrnmoni]
+    python3 xrnmoni.py user add|remove|list [NAME] --data DIR [--users FILE]
+    python3 xrnmoni.py token add DEVICE|list|revoke ID --data DIR
+
+DIR holds the database, the device tokens and, by default, the users file.
+"""
+import argparse
+import base64
+import hashlib
+import hmac
+import ipaddress
+import json
+import math
+import os
+import re
+import secrets
+import sqlite3
+import sys
+import threading
+import time
+import zlib
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
+
+MAX_BODY = 8 * 1024 * 1024  # an agent back after days offline sends what it kept, up to MAX_EVENTS
+MAX_EVENTS = 10000
+MAX_SPAN_S = 7 * 86400  # one event; a laptop asleep over a long weekend is still one
+MAX_RANGE_S = 62 * 86400  # what one view reads
+EARLIEST = 946684800.0  # 2000-01-01: a clock that far back is wrong
+AHEAD_S = 86400  # a clock that far ahead is wrong too
+FIELD_MAX = {"app": 200, "title": 1000, "url": 4000, "domain": 253, "os": 32}
+EVENT_ID = re.compile(r"[0-9a-f]{32}")
+EVENT_TYPE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
+LEGACY_TYPES = {"browser": "web", "afk": "idle"}  # what the first agent called them
+AWAY = ("sleep", "locked", "idle")  # time nobody was at the device, strongest first
+DEVICE_NAME = re.compile(r"[^\x00-\x1f\x7f]{1,64}")
+MERGE_GAP_S = 5  # pieces of the same thing this close are one stretch on the timeline
+TOP = 50
+RETAIN_DAYS = 400
+PRUNE_EVERY_S = 86400
+PREFIX = "/xrnmoni"
+DEFAULT_PORT = 5240
+LOG_MAX = 5 * 1024 * 1024
+
+AUTH_CACHE_S = 600  # a bcrypt check costs ~0.3s on a phone; don't pay it per request
+FAIL_DELAY_S = 2  # after a wrong one, as Radicale does
+MAX_HELD = 8  # wrong logins held for FAIL_DELAY_S at once; any more are answered at once
+FAIL_LIMIT = 10  # different wrong logins from one address within FAIL_WINDOW_S, then 429
+FAIL_WINDOW_S = 15 * 60
+USER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+TOKEN = re.compile(r"xrnmoni_([0-9a-f]{8})_([A-Za-z0-9_-]{43})")
+TOKEN_ID = re.compile(r"[0-9a-f]{8}")
+MAX_TOKENS = 50
+
+WEB_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+}
+WEB_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,80}")
+JSON = "application/json; charset=utf-8"
+# The page's own files and requests to this server, nothing else: a window title that slipped
+# past the page's escaping still couldn't run or send anything anywhere.
+BASE_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy": (
+        "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; "
+        "connect-src 'self'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'"
+    ),
+}
+
+# The request line and X-Forwarded-For come from the caller. Written to the log as they are, a
+# control character in them could rewrite the terminal the log is read in, or (a \r) start a line
+# of its own for a log reader. Escaped as http.server's own log_message, replaced here, does.
+LOG_ESCAPES = str.maketrans({**{c: f"\\x{c:02x}" for c in (*range(0x20), *range(0x7F, 0xA0))}, "\\": "\\\\"})
+
+
+def log(line):
+    if sys.stderr is not None:
+        sys.stderr.write(line.translate(LOG_ESCAPES) + "\n")
+
+
+class LogFile:
+    """Where the log goes when there is no console (pythonw on Windows, a scheduled task): a file in
+    the data folder, each line stamped, kept to two files of LOG_MAX. Without it the first line
+    written to the missing stderr ended the server."""
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.f = open(path, "a", encoding="utf-8")
+
+    def write(self, text):
+        with self.lock:
+            stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S ")
+            lines = text.splitlines(keepends=True)
+            self.f.write("".join(stamp + line for line in lines))
+            self.f.flush()
+            if self.f.tell() > LOG_MAX:
+                self.f.close()
+                os.replace(self.path, self.path + ".1")
+                self.f = open(self.path, "a", encoding="utf-8")
+        return len(text)
+
+    def flush(self):
+        pass
+
+
+def write_private(path, text):
+    """Writes [text] whole to a new file that then takes [path]'s place, so a reader gets one
+    version or the other, never half of one."""
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def file_stamp(path):
+    """What changes whenever the file is written again (they're swapped in by rename), or None."""
+    try:
+        st = os.stat(path)
+        return st.st_ino, st.st_mtime_ns, st.st_size
+    except FileNotFoundError:
+        return None
+
+
+# ---- events -------------------------------------------------------------------------------------
+
+class BadEvent(ValueError):
+    pass
+
+
+def number(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise BadEvent(f"{name} must be a number")
+    return float(value)
+
+
+def text_field(e, key):
+    value = e.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise BadEvent(f"{key} must be text")
+    return value[:FIELD_MAX[key]] or None
+
+
+def domain_of(url):
+    try:
+        host = urlsplit(url).hostname if url else None
+    except ValueError:
+        return None
+    return host.lower()[:FIELD_MAX["domain"]] if host else None
+
+
+def clean_event(e, now):
+    """(uid, type, app, title, url, domain, start, end, duration) for one event an agent sent, or
+    BadEvent saying what is wrong with it. The first agent's `browser` and `afk` are stored as
+    `web` and `idle`; a type this server doesn't know is kept as it is."""
+    if not isinstance(e, dict):
+        raise BadEvent("not an object")
+    uid = e.get("id")
+    if uid is not None:
+        uid = uid.replace("-", "").lower() if isinstance(uid, str) else None
+        if not uid or not EVENT_ID.fullmatch(uid):
+            raise BadEvent("id must be 32 hex digits")
+    kind = e.get("type", "app")
+    if not isinstance(kind, str) or not EVENT_TYPE.fullmatch(kind):
+        raise BadEvent("bad type")
+    kind = LEGACY_TYPES.get(kind, kind)
+    if e.get("ts_start") is None:
+        raise BadEvent("ts_start missing")
+    start = number(e["ts_start"], "ts_start")
+    end = None if e.get("ts_end") is None else number(e["ts_end"], "ts_end")
+    duration = None if e.get("duration") is None else number(e["duration"], "duration")
+    if duration is not None and duration < 0:
+        raise BadEvent("duration is negative")
+    if end is None:
+        end = start + (duration or 0.0)
+    if not EARLIEST <= start <= now + AHEAD_S or end > now + AHEAD_S:
+        raise BadEvent("time out of range")
+    if end < start:
+        raise BadEvent("ts_end is before ts_start")
+    if end - start > MAX_SPAN_S:
+        raise BadEvent("longer than 7 days")
+    url = text_field(e, "url")
+    domain = text_field(e, "domain")
+    domain = domain.strip().lower() if domain else domain_of(url)
+    return (uid, kind, text_field(e, "app"), text_field(e, "title"), url, domain or None,
+            start, end, end - start if duration is None else duration)
+
+
+SCHEMA_VERSION = 2
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    uid        TEXT,
+    device     TEXT NOT NULL,
+    type       TEXT NOT NULL,
+    app        TEXT,
+    title      TEXT,
+    url        TEXT,
+    domain     TEXT,
+    ts_start   REAL NOT NULL,
+    ts_end     REAL,
+    duration   REAL,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS devices (
+    device     TEXT PRIMARY KEY,
+    os         TEXT,
+    first_seen REAL,
+    last_seen  REAL
+);
+"""
+
+
+class Store:
+    """The events, in SQLite (WAL, so a backup or the sqlite3 shell can read it while it runs).
+    One connection behind a lock: a handful of devices and one viewer don't need more."""
+
+    def __init__(self, path):
+        self.lock = threading.Lock()
+        self.db = sqlite3.connect(path, check_same_thread=False, timeout=30)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=NORMAL")
+        with self.db:
+            self.migrate()
+        self.spans = dict(self.db.execute("SELECT device, max_span FROM devices"))
+
+    def migrate(self):
+        """Makes the tables, or brings the first server's xrnmoni.db up to date: an id column for
+        dedupe, the old type names renamed, point events given an end, and each device's longest
+        event noted (reads go back that far for what reaches into a day)."""
+        version = self.db.execute("PRAGMA user_version").fetchone()[0]
+        if version >= SCHEMA_VERSION:
+            return
+        self.db.executescript(SCHEMA)
+        columns = {r[1] for r in self.db.execute("PRAGMA table_info(events)")}
+        if "uid" not in columns:
+            self.db.execute("ALTER TABLE events ADD COLUMN uid TEXT")
+        if "max_span" not in {r[1] for r in self.db.execute("PRAGMA table_info(devices)")}:
+            self.db.execute("ALTER TABLE devices ADD COLUMN max_span REAL NOT NULL DEFAULT 0")
+        for old, new in LEGACY_TYPES.items():
+            self.db.execute("UPDATE events SET type=? WHERE type=?", (new, old))
+        self.db.execute("UPDATE events SET ts_end = ts_start + MAX(COALESCE(duration, 0), 0) WHERE ts_end IS NULL")
+        # Every read is one device's time range, and the type index served none of them.
+        self.db.execute("DROP INDEX IF EXISTS idx_events_type")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_events_device_ts ON events(device, ts_start)")
+        self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_events_uid ON events(uid)")
+        self.db.execute("""UPDATE devices SET max_span = COALESCE(
+            (SELECT MAX(ts_end - ts_start) FROM events WHERE events.device = devices.device), 0)""")
+        self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+    def insert(self, device, os_name, rows, now):
+        """Stores [rows] (from clean_event) for [device]; one already here by its id is left out.
+        Returns how many were new."""
+        span = max((r[7] - r[6] for r in rows), default=0.0)
+        with self.lock, self.db:
+            before = self.db.total_changes
+            self.db.executemany(
+                """INSERT OR IGNORE INTO events
+                   (uid, device, type, app, title, url, domain, ts_start, ts_end, duration, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                [(r[0], device, *r[1:], now) for r in rows])
+            inserted = self.db.total_changes - before
+            self.db.execute(
+                """INSERT INTO devices (device, os, first_seen, last_seen, max_span) VALUES (?,?,?,?,?)
+                   ON CONFLICT(device) DO UPDATE SET
+                       last_seen = excluded.last_seen,
+                       os = COALESCE(excluded.os, devices.os),
+                       max_span = MAX(devices.max_span, excluded.max_span)""",
+                (device, os_name, now, now, span))
+            self.spans[device] = max(self.spans.get(device, 0.0), span)
+        return inserted
+
+    def devices(self):
+        with self.lock:
+            cur = self.db.execute("SELECT device, os, first_seen, last_seen FROM devices ORDER BY device")
+            return [dict(zip(("device", "os", "first_seen", "last_seen"), r)) for r in cur]
+
+    def latest(self, device):
+        """The device's newest events, newest first."""
+        with self.lock:
+            return self.db.execute(
+                """SELECT type, app, title, url, domain, ts_start, ts_end FROM events
+                   WHERE device=? ORDER BY ts_start DESC LIMIT 50""", (device,)).fetchall()
+
+    def rows(self, device, since, until):
+        """(type, app, title, url, domain, start, end) of each event of [device] that reaches into
+        [since, until), earliest first. An event that began before [since] counts too: reads start
+        as far back as the device's longest event."""
+        with self.lock:
+            low = since - self.spans.get(device, 0.0) - 1
+            return self.db.execute(
+                """SELECT type, app, title, url, domain, ts_start, ts_end FROM events
+                   WHERE device=? AND ts_start >= ? AND ts_start < ? AND ts_end >= ?
+                   ORDER BY ts_start, id""", (device, low, until, since)).fetchall()
+
+    def page(self, devices, since, until, after, limit):
+        """Up to [limit] events of [devices] starting in [since, until), oldest first, after the
+        (ts_start, id) [after]: an export reads in pages, so posts aren't held up behind it."""
+        marks = ",".join("?" * len(devices))
+        with self.lock:
+            return self.db.execute(
+                f"""SELECT id, uid, device, type, app, title, url, domain, ts_start, ts_end, duration
+                    FROM events WHERE device IN ({marks}) AND ts_start >= ? AND ts_start < ?
+                    AND (ts_start > ? OR (ts_start = ? AND id > ?))
+                    ORDER BY ts_start, id LIMIT ?""",
+                (*devices, since, until, after[0], after[0], after[1], limit)).fetchall()
+
+    def newest(self, devices, since, until, limit):
+        marks = ",".join("?" * len(devices))
+        with self.lock:
+            return self.db.execute(
+                f"""SELECT uid, device, type, app, title, url, domain, ts_start, ts_end, duration
+                    FROM events WHERE device IN ({marks}) AND ts_start >= ? AND ts_start < ?
+                    ORDER BY ts_start DESC, id DESC LIMIT ?""", (*devices, since, until, limit)).fetchall()
+
+    def prune(self, before):
+        """Deletes every event that began before [before]; how many went."""
+        gone = 0
+        for d in self.devices():
+            with self.lock, self.db:
+                gone += self.db.execute("DELETE FROM events WHERE device=? AND ts_start < ?",
+                                        (d["device"], before)).rowcount
+        with self.lock:
+            self.db.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        return gone
+
+
+# ---- what a day adds up to ----------------------------------------------------------------------
+
+def one_layer(pieces):
+    """[pieces] (start, end, what), earliest first, made not to overlap: where two do, the one that
+    began first keeps the time. The same interval sent twice by an agent too old to give ids is
+    counted once that way."""
+    out, edge = [], -math.inf
+    for start, end, what in pieces:
+        start = max(start, edge)
+        if end > start:
+            out.append((start, end, what))
+            edge = end
+    return out
+
+
+def away_layer(pieces):
+    """The stretches covered by any of [pieces] (start, end, kind), each named by the strongest
+    kind over it (sleep, then locked, then idle), without overlaps."""
+    marks = sorted([(s, 1, k) for s, e, k in pieces] + [(e, -1, k) for s, e, k in pieces])
+    counts = dict.fromkeys(AWAY, 0)
+    out, prev = [], None
+    for t, step, kind in marks:
+        if prev is not None and t > prev:
+            top = next((k for k in AWAY if counts[k] > 0), None)
+            if top:
+                if out and out[-1][2] == top and out[-1][1] == prev:
+                    out[-1] = (out[-1][0], t, top)
+                else:
+                    out.append((prev, t, top))
+        counts[kind] += step
+        prev = t
+    return out
+
+
+def add(table, key, seconds):
+    table[key] = table.get(key, 0.0) + seconds
+
+
+def ranked(table, limit=TOP):
+    return [[k, round(v, 1)] for k, v in sorted(table.items(), key=lambda kv: (-kv[1], str(kv[0])))[:limit]]
+
+
+class Day:
+    """What [rows] of one device add up to between [since] and [until].
+
+    Time counts as active when an app or a page was in front and the device wasn't idle, locked or
+    asleep: a page left open while nobody was there, or an app the agent saw in front of the lock
+    screen, isn't time spent. An event reaching past either end counts only for its part inside."""
+
+    def __init__(self, rows, since, until, category, want=None):
+        self.active = 0.0
+        self.totals = {}
+        self.apps, self.sites, self.categories = {}, {}, {}
+        self.details = {}  # the titles or pages behind [want] = ("app"|"site"|"category", name)
+        self.segments, self.web, self.marks = [], [], []
+        self.first = self.last = None
+        apps, webs, aways = [], [], []
+        for kind, app, title, url, domain, start, end in rows:
+            if end <= start:
+                if since <= start < until:
+                    self.marks.append([round(start, 1), kind])
+                continue
+            s, e = max(start, since), min(end, until)
+            if e <= s:
+                continue
+            self.first = s if self.first is None else min(self.first, s)
+            self.last = e if self.last is None else max(self.last, e)
+            if kind == "app":
+                apps.append((s, e, (app or "?", title or "")))
+            elif kind == "web":
+                webs.append((s, e, (domain or "?", title or "", url or "")))
+            elif kind in AWAY:
+                aways.append((s, e, kind))
+            else:
+                add(self.totals, kind, e - s)
+        apps.sort(key=lambda p: p[0])
+        webs.sort(key=lambda p: p[0])
+        self.sweep(one_layer(apps), one_layer(webs), away_layer(aways), category, want)
+
+    def sweep(self, apps, webs, aways, category, want):
+        cuts = sorted({t for layer in (apps, webs, aways) for p in layer for t in p[:2]})
+        at = [0, 0, 0]
+        layers = (apps, webs, aways)
+        for x, y in zip(cuts, cuts[1:]):
+            now = []
+            for n, layer in enumerate(layers):
+                while at[n] < len(layer) and layer[at[n]][1] <= x:
+                    at[n] += 1
+                piece = layer[at[n]] if at[n] < len(layer) and layer[at[n]][0] <= x else None
+                now.append(piece)
+            app, web, away = now
+            d = y - x
+            if away:
+                add(self.totals, away[2], d)
+                self.stretch(self.segments, x, y, away[2], "", None)
+                continue
+            if not app and not web:
+                continue
+            self.active += d
+            # A page's category, where it has one, says more than the browser's.
+            cat, source = None, None
+            if web:
+                add(self.totals, "web", d)
+                add(self.sites, web[2][0], d)
+                cat = category("site", web[2][0])
+                source = (web[2][0], "site")
+            if app:
+                add(self.totals, "app", d)
+                add(self.apps, app[2][0], d)
+                if not cat:
+                    cat, source = category("app", app[2][0]), (app[2][0], "app")
+            add(self.categories, cat or "", d)
+            if web:
+                self.stretch(self.web, x, y, "web", web[2][0], cat)
+            self.stretch(self.segments, x, y, "app" if app else "web", (app or web)[2][0], cat)
+            if want:
+                self.detail(want, app, web, cat, source, d)
+
+    def detail(self, want, app, web, cat, source, d):
+        """Adds [d] seconds to the row [want] asks for: an app's window titles, a site's pages (by
+        title, with the first address seen for it), or a category's apps and sites."""
+        kind, name = want
+        if kind == "app" and app and app[2][0] == name:
+            key, extra = app[2][1], ""
+        elif kind == "site" and web and web[2][0] == name:
+            key, extra = web[2][1], web[2][2]
+        elif kind == "category" and (cat or "") == name:
+            key, extra = source
+        else:
+            return
+        row = self.details.setdefault(key, [0.0, extra])
+        row[0] += d
+
+    @staticmethod
+    def stretch(segments, x, y, state, label, cat):
+        last = segments[-1] if segments else None
+        if last and last[2] == state and last[3] == label and last[4] == cat and x - last[1] <= MERGE_GAP_S:
+            last[1] = y
+        else:
+            segments.append([x, y, state, label, cat])
+
+    def answer(self, timeline=True):
+        doc = {
+            "active": round(self.active, 1),
+            "totals": {k: round(v, 1) for k, v in sorted(self.totals.items())},
+            "apps": ranked(self.apps),
+            "sites": ranked(self.sites),
+            "categories": ranked(self.categories),
+            "first": self.first,
+            "last": self.last,
+        }
+        if timeline:
+            r = lambda segs: [[round(s[0], 1), round(s[1], 1), *s[2:]] for s in segs]  # noqa: E731
+            doc.update(segments=r(self.segments), web=[[s[0], s[1], s[3], s[4]] for s in r(self.web)],
+                       marks=self.marks)
+        return doc
+
+
+# ---- categories ---------------------------------------------------------------------------------
+
+# ---- device tokens ------------------------------------------------------------------------------
+
+class Tokens:
+    """What an agent posts with instead of a password: `xrnmoni_<id>_<secret>`, one per device, made
+    and revoked with `xrnmoni.py token`. Only a SHA-256 of the secret is kept, in tokens.json, so a
+    copy of that file posts nothing; the secret is 32 random bytes, which no guessing reaches, so a
+    fast hash is enough. A token posts events under its own device's name and reads nothing.
+
+    The first server had one shared token in XRNMONI_TOKEN; it still posts, under the name the
+    agent sends."""
+
+    def __init__(self, path, legacy=""):
+        self.path = path
+        self.legacy = legacy
+        self.lock = threading.Lock()
+        self.seen = None
+        self.found = []
+
+    def read(self):
+        stamp = file_stamp(self.path)
+        with self.lock:
+            if stamp == self.seen:
+                return self.found
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                doc = json.load(f)
+            found = doc.get("tokens") if isinstance(doc, dict) else None
+            found = [t for t in found if isinstance(t, dict)] if isinstance(found, list) else []
+        except FileNotFoundError:
+            found = []
+        except (OSError, ValueError) as e:
+            log(f"{self.path} can't be read, so the tokens read before it hold: {e}")
+            return self.found
+        with self.lock:
+            self.seen, self.found = stamp, found
+        return found
+
+    def device_for(self, header):
+        """(True, device) for a device token, (True, None) for the old shared token, (False, None)
+        for anything else."""
+        if not header or not header.startswith("Bearer "):
+            return False, None
+        given = header[7:].strip()
+        m = TOKEN.fullmatch(given)
+        if m:
+            token_id, secret = m.groups()
+            want = hashlib.sha256(secret.encode()).hexdigest()
+            for t in self.read():
+                if t.get("id") == token_id and hmac.compare_digest(str(t.get("sha256", "")), want):
+                    return True, t.get("device")
+            return False, None
+        if self.legacy and hmac.compare_digest(given.encode(), self.legacy.encode()):
+            return True, None
+        return False, None
+
+    def add(self, device):
+        if not isinstance(device, str) or not DEVICE_NAME.fullmatch(device.strip()):
+            raise ValueError("a device name is 1 to 64 characters, with no control characters")
+        found = self.read()
+        if len(found) >= MAX_TOKENS:
+            raise ValueError(f"there are {MAX_TOKENS} tokens already; revoke one first")
+        taken = {t.get("id") for t in found}
+        token_id = secrets.token_hex(4)
+        while token_id in taken:
+            token_id = secrets.token_hex(4)
+        secret = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("=")
+        entry = {"id": token_id, "device": device.strip(), "sha256": hashlib.sha256(secret.encode()).hexdigest(),
+                 "created": int(time.time())}
+        write_private(self.path, json.dumps({"tokens": [*found, entry]}, ensure_ascii=False, indent=1))
+        return f"xrnmoni_{token_id}_{secret}"
+
+    def revoke(self, token_id):
+        found = self.read()
+        kept = [t for t in found if t.get("id") != token_id]
+        if len(kept) == len(found):
+            return False
+        write_private(self.path, json.dumps({"tokens": kept}, ensure_ascii=False, indent=1))
+        return True
+
+
+# ---- logins -------------------------------------------------------------------------------------
+
+def read_names(users_path):
+    """The user names an htpasswd file lists, first first: the first is the owner."""
+    found = []
+    try:
+        with open(users_path, encoding="utf-8") as f:
+            for line in f:
+                name = line.strip().partition(":")[0]
+                if USER_NAME.fullmatch(name):
+                    found.append(name)
+    except OSError:
+        pass
+    return found
+
+
+def basic_login(header):
+    """(user, secret) from `Authorization: Basic ...`, or (None, None)."""
+    if not header or not header.startswith("Basic "):
+        return None, None
+    try:
+        user, _, secret = base64.b64decode(header[6:]).decode("utf-8").partition(":")
+    except Exception:
+        return None, None
+    return user, secret
+
+
+class Login:
+    """Basic auth against an htpasswd file of bcrypt hashes, and the count of wrong logins per address."""
+
+    def __init__(self, users_path):
+        self.users_path = users_path
+        self.cache = {}  # sha256(user:secret) -> (user, expires, users-file mtime)
+        self.fail_lock = threading.Lock()
+        self.fail_settled = threading.Condition(self.fail_lock)
+        # client address -> {sha256 of a wrong Authorization: (monotonic time it last came, user name)}
+        self.failures = {}
+        self.checking = {}  # client address -> how many of its logins are being checked right now
+        self.held = threading.BoundedSemaphore(MAX_HELD)
+
+    def users_mtime(self):
+        try:
+            return os.stat(self.users_path).st_mtime
+        except OSError:
+            return 0
+
+    def cached_basic(self, header):
+        """The user name for a password already found right (the auth cache), else None: no check."""
+        user, secret = basic_login(header)
+        if user is None:
+            return None
+        hit = self.cache.get(hashlib.sha256(f"{user}:{secret}".encode()).hexdigest())
+        return hit[0] if hit and hit[1] > time.time() and hit[2] == self.users_mtime() else None
+
+    def check_basic(self, header):
+        """The user name for a valid `Authorization: Basic ...`, else None."""
+        user, secret = basic_login(header)
+        if user is None or not USER_NAME.fullmatch(user):
+            return None
+        key = hashlib.sha256(f"{user}:{secret}".encode()).hexdigest()
+        mtime = self.users_mtime()
+        hit = self.cache.get(key)
+        if hit and hit[1] > time.time() and hit[2] == mtime:
+            return hit[0]
+        import bcrypt  # only needed once someone logs in
+
+        try:
+            checked, spare = False, None
+            with open(self.users_path, encoding="utf-8") as f:
+                for line in f:
+                    name, _, hashed = line.strip().partition(":")
+                    spare = hashed or spare
+                    if name == user and hashed:
+                        checked = True
+                        if bcrypt.checkpw(secret.encode(), hashed.encode()):
+                            now = time.time()
+                            if len(self.cache) > 1000:
+                                self.cache = {k: v for k, v in self.cache.items() if v[1] > now}
+                            self.cache[key] = (user, now + AUTH_CACHE_S, mtime)
+                            return user
+            if not checked and spare:
+                # A name that isn't there takes as long as a wrong password for one that is, or
+                # the time an answer takes says which names exist. The result is never used.
+                bcrypt.checkpw(secret.encode(), spare.encode())
+        except (OSError, ValueError):
+            pass
+        return None
+
+    def recent_failures(self, addr, now):
+        """This address's wrong logins within FAIL_WINDOW_S. Under fail_lock."""
+        recent = {k: f for k, f in self.failures.get(addr, {}).items() if now - f[0] < FAIL_WINDOW_S}
+        if recent:
+            self.failures[addr] = recent
+        else:
+            self.failures.pop(addr, None)
+        return recent
+
+    def locked_out(self, addr):
+        with self.fail_lock:
+            return len(self.recent_failures(addr, time.monotonic())) >= FAIL_LIMIT
+
+    def reserve_guess(self, addr, header):
+        """Waits for a place to check a login from this address in; False once the address has used
+        up its wrong logins. A login being checked holds a place until settle_guess, so guesses sent
+        at once can't all pass the limit while the first are still in bcrypt; one that finds no
+        place waits rather than being turned away. A wrong login sent again needs no place: it is
+        counted already."""
+        key = hashlib.sha256(header.encode()).hexdigest()
+        with self.fail_settled:
+            now = time.monotonic()
+            if len(self.failures) > 10000:  # a flood from many addresses: forget the stale ones
+                for a in [a for a, fs in self.failures.items()
+                          if now - max((f[0] for f in fs.values()), default=0) >= FAIL_WINDOW_S]:
+                    del self.failures[a]
+            while True:
+                recent = self.recent_failures(addr, time.monotonic())
+                if len(recent) >= FAIL_LIMIT:
+                    return False
+                if key in recent or len(recent) + self.checking.get(addr, 0) < FAIL_LIMIT:
+                    self.checking[addr] = self.checking.get(addr, 0) + 1
+                    return True
+                self.fail_settled.wait(1)
+
+    def settle_guess(self, addr, header, right):
+        """A login reserve_guess let through has been checked. A wrong one counts against the
+        address, and the same one again counts once: that's an agent still sending a revoked token
+        or a browser an old password, every few seconds, not someone guessing, and counting each
+        would lock the owner out of the dashboard on the same machine. A right one clears that
+        name's mistakes from this address, no one else's. None settles nothing."""
+        name = (basic_login(header)[0] or "")[:64]
+        with self.fail_settled:
+            left = self.checking.get(addr, 1) - 1
+            if left > 0:
+                self.checking[addr] = left
+            else:
+                self.checking.pop(addr, None)
+            if right is False:
+                self.failures.setdefault(addr, {})[hashlib.sha256(header.encode()).hexdigest()] = (time.monotonic(), name)
+            elif right:
+                kept = {k: f for k, f in self.failures.get(addr, {}).items() if f[1] != name}
+                if kept:
+                    self.failures[addr] = kept
+                else:
+                    self.failures.pop(addr, None)
+            self.fail_settled.notify_all()
+
+    def hold_wrong_login(self):
+        """Holds a wrong login's answer FAIL_DELAY_S, at most MAX_HELD at once: each is a thread."""
+        if self.held.acquire(blocking=False):
+            try:
+                time.sleep(FAIL_DELAY_S)
+            finally:
+                self.held.release()
+
+
+def client_address(handler):
+    """Who a wrong login is counted for. Behind a local proxy that's the last X-Forwarded-For hop,
+    the one the proxy added: anything before it came from the caller, who could make up a new
+    address for every guess. The header is only trusted from a loopback peer, for the same reason.
+    An IPv6 address counts as its /64: a line comes with at least that many."""
+    addr = caller(handler)
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return addr
+    if ip.version == 4:
+        return addr
+    if ip.ipv4_mapped:
+        return str(ip.ipv4_mapped)
+    return f"{ipaddress.IPv6Address(int(ip) >> 64 << 64)}/64"
+
+
+def caller(handler):
+    peer = handler.client_address[0]
+    forwarded = handler.headers.get("X-Forwarded-For") if handler.headers else None
+    return forwarded.split(",")[-1].strip() if forwarded and peer in ("127.0.0.1", "::1") else peer
+
+
+def from_another_site(headers):
+    """Whether a request came from another site's page. A browser that was once given the password
+    in its own sign-in box sends it again with a form any site posts here. The browser says where
+    the page was in Sec-Fetch-Site; one too old for that still sends Origin with a POST, held against
+    this host's name (or the proxy's X-Forwarded-Host). Agents send neither."""
+    origin = (headers.get("Origin") or "").strip().lower()
+    if origin.startswith(("chrome-extension://", "moz-extension://")):
+        return False
+    site = (headers.get("Sec-Fetch-Site") or "").strip().lower()
+    if site:
+        return site in ("cross-site", "same-site")
+    scheme, _, host = origin.partition("://")
+    if scheme not in ("http", "https"):
+        return False  # no Origin, or "null"
+    ours = [headers.get("Host") or "", *(headers.get("X-Forwarded-Host") or "").split(",")]
+    return host_key(host) not in {host_key(h) for h in ours if h.strip()}
+
+
+def host_key(host):
+    return host.strip().lower().removesuffix(":443").removesuffix(":80")
+
+
+# ---- the server ---------------------------------------------------------------------------------
+
+class App:
+    def __init__(self, data, users=None, web=None, prefix=PREFIX, retain_days=RETAIN_DAYS, viewers=(),
+                 legacy_token=None):
+        self.data = data
+        self.users = users or os.path.join(data, "users")
+        self.web = web or os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
+        self.prefix = prefix.rstrip("/")
+        self.retain_days = retain_days
+        self.viewers = set(viewers)
+        self.store = Store(os.path.join(data, "xrnmoni.db"))
+        self.login = Login(self.users)
+        if legacy_token is None:
+            legacy_token = os.environ.get("XRNMONI_TOKEN", "").strip()
+        if legacy_token == "change-me":
+            log("XRNMONI_TOKEN is the example's change-me, so it posts nothing; make device tokens with: token add")
+            legacy_token = ""
+        elif legacy_token and len(legacy_token) < 16:
+            log("XRNMONI_TOKEN is short; device tokens (token add) are safer")
+        self.tokens = Tokens(os.path.join(data, "tokens.json"), legacy_token)
+        self.pages = {}  # web file -> (stamp, ETag, bytes)
+
+    def is_viewer(self, user):
+        return user in self.viewers or user == next(iter(read_names(self.users)), None)
+
+    def prune(self, now=None):
+        if not self.retain_days:
+            return 0
+        gone = self.store.prune((now or time.time()) - self.retain_days * 86400)
+        if gone:
+            log(f"pruned {gone} events older than {self.retain_days} days")
+        return gone
+
+    def pruner(self):
+        while True:
+            try:
+                self.prune()
+            except sqlite3.Error as e:
+                log(f"prune: {e}")
+            time.sleep(PRUNE_EVERY_S)
+
+    def device_names(self, only):
+        names = [d["device"] for d in self.store.devices()]
+        return [n for n in names if n == only] if only is not None else names
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "xrnmoni/1"
+    sys_version = ""  # the Server header named the Python version too
+    timeout = 120  # seconds of silence before a connection is dropped, so a stalled client can't hold a thread
+    app = None
+
+    def log_message(self, fmt, *a):
+        headers = getattr(self, "headers", None)  # none yet on a request line that didn't parse
+        who = "".join(caller(self).split()) or "-" if headers else "-"
+        log(f"{who} {fmt % a}")
+
+    def handle(self):
+        # A caller hanging up is the network, not a fault here: one line says so.
+        try:
+            super().handle()
+        except ConnectionError as e:
+            self.close_connection = True
+            self.log_message("connection dropped: %s", type(e).__name__)
+
+    def parse_request(self):
+        if not super().parse_request():
+            return False
+        # Before the login, which a page elsewhere can have the browser pass for it.
+        if self.command not in ("GET", "HEAD", "OPTIONS") and from_another_site(self.headers):
+            self.send(403, "refused: sent from another site's page")
+            return False
+        return True
+
+    def route(self):
+        path = self.path.partition("?")[0]
+        prefix = self.app.prefix
+        if prefix and (path == prefix or path.startswith(prefix + "/")):
+            path = path[len(prefix):] or "/"
+        return path
+
+    def query(self):
+        return {k: v[0] for k, v in parse_qs(self.path.partition("?")[2]).items()}
+
+    def send(self, code, body=b"", ctype="text/plain; charset=utf-8", headers=None, cache="no-store"):
+        if isinstance(body, str):
+            body = body.encode()
+        self.send_response(code)
+        self.send_header("Cache-Control", cache)
+        for k, v in BASE_HEADERS.items():
+            self.send_header(k, v)
+        if code != 304:
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD" and code != 304:
+            self.wfile.write(body)
+
+    def send_json(self, doc, headers=None):
+        self.send(200, json.dumps(doc, ensure_ascii=False, separators=(",", ":")), JSON, headers)
+
+    def body(self):
+        """The request's JSON, or None once an error has been answered."""
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            self.send(411, "send a Content-Length")
+            return None
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self.close_connection = True
+            self.send(400, "bad Content-Length")
+            return None
+        if length <= 0 or length > MAX_BODY:
+            self.close_connection = True
+            self.send(413, "body missing or too large")
+            return None
+        raw = self.rfile.read(length)
+        if len(raw) < length:
+            # The connection closed part way, as a proxy closes this side when the caller's drops.
+            self.close_connection = True
+            self.send(400, "the upload stopped short")
+            return None
+        encoding = (self.headers.get("Content-Encoding") or "").strip().lower()
+        if encoding == "gzip":
+            try:
+                inflate = zlib.decompressobj(wbits=31)
+                raw = inflate.decompress(raw, MAX_BODY + 1)
+            except zlib.error:
+                self.send(400, "bad gzip")
+                return None
+            if len(raw) > MAX_BODY or inflate.unconsumed_tail:
+                self.send(413, "body too large")
+                return None
+        elif encoding not in ("", "identity"):
+            self.send(415, "send it plain or gzip")
+            return None
+        try:
+            return json.loads(raw)
+        except (ValueError, RecursionError):
+            self.send(400, "body must be JSON")
+            return None
+
+    def password(self):
+        """The user of a right `Authorization: Basic`, or None once a 401 or 429 has been answered."""
+        login = self.app.login
+        addr = client_address(self)
+        header = self.headers.get("Authorization")
+        # Turned away unchecked, a login guesses nothing, so its 429 isn't held.
+        if not (login.reserve_guess(addr, header) if header else not login.locked_out(addr)):
+            self.send(429, "too many wrong passwords; try again later",
+                      headers={"Retry-After": str(FAIL_WINDOW_S)})
+            return None
+        user, right = None, None
+        if header:
+            try:
+                # A password already found right is a session, not a login, and settles nothing.
+                user = login.cached_basic(header)
+                if not user:
+                    user = login.check_basic(header)
+                    right = bool(user)
+            finally:
+                login.settle_guess(addr, header, right)
+        if not user:
+            if header:
+                login.hold_wrong_login()
+            self.send(401, "login required", headers={"WWW-Authenticate": 'Basic realm="xrnmoni"'})
+        return user
+
+    def viewer(self):
+        """The signed-in viewer, or None once a refusal has been answered."""
+        user = self.password()
+        if user and not self.app.is_viewer(user):
+            # The users file may be shared with other services and other people.
+            self.send(403, "this account can't see the dashboard")
+            return None
+        return user
+
+    def device_token(self):
+        """(device name or None, True) for a device token, or (None, False) once a refusal has been
+        answered. Wrong tokens count as wrong logins."""
+        login = self.app.login
+        addr = client_address(self)
+        header = self.headers.get("Authorization")
+        if not (login.reserve_guess(addr, header) if header else not login.locked_out(addr)):
+            self.send(429, "too many wrong tokens; try again later", headers={"Retry-After": str(FAIL_WINDOW_S)})
+            return None, False
+        ok, device = False, None
+        if header:
+            try:
+                ok, device = self.app.tokens.device_for(header)
+            finally:
+                login.settle_guess(addr, header, None if ok else False)
+        if not ok:
+            if header:
+                login.hold_wrong_login()
+            self.send(401, "bad or missing token", headers={"WWW-Authenticate": 'Bearer realm="xrnmoni"'})
+            return None, False
+        return device, True
+
+    def do_HEAD(self):
+        self.do_GET()
+
+    def do_GET(self):
+        path = self.route()
+        if path == "/health":
+            return self.send(200, "ok")
+        if path == "/healthz":
+            return self.send(200, '{"ok":true}', JSON)
+        if not path.startswith("/api/"):
+            return self.serve_web(path)
+        reads = {"/api/devices": self.get_devices, "/api/activity": self.get_activity,
+                 "/api/summary": self.get_summary}
+        if path not in reads:
+            return self.send(404, "not found")
+        if not self.viewer():
+            return None
+        try:
+            return reads[path](self.query())
+        except sqlite3.Error as e:
+            log(f"database: {e}")
+            return self.send(503, "the database can't be read")
+        except BadQuery as e:
+            return self.send(400, str(e))
+
+    def do_POST(self):
+        path = self.route()
+        if path != "/api/events":
+            return self.send(404, "not found")
+        device, ok = self.device_token()
+        if not ok:
+            return None
+        doc = self.body()
+        if doc is None:
+            return None
+        return self.post_events(device, doc)
+
+    def post_events(self, bound, doc):
+        events = doc.get("events") if isinstance(doc, dict) else None
+        if not isinstance(events, list):
+            return self.send(400, 'body must be {"device", "os", "events": [...]}')
+        if len(events) > MAX_EVENTS:
+            return self.send(400, f"at most {MAX_EVENTS} events at a time")
+        device = doc.get("device")
+        if bound is None and (not isinstance(device, str) or not DEVICE_NAME.fullmatch(device.strip())):
+            return self.send(400, "device must be a name of 1 to 64 characters")
+        # A device token posts as its own device, whatever the body says: a token taken from one
+        # machine can't write another's day.
+        device = bound or device.strip()
+        os_name = doc.get("os")
+        os_name = os_name[:FIELD_MAX["os"]] if isinstance(os_name, str) and os_name else None
+        now = time.time()
+        rows, rejected = [], []
+        for i, e in enumerate(events):
+            try:
+                rows.append(clean_event(e, now))
+            except BadEvent as err:
+                uid = e.get("id") if isinstance(e, dict) and isinstance(e.get("id"), str) else None
+                rejected.append({"index": i, "id": uid[:64] if uid else None, "error": str(err)})
+        try:
+            inserted = self.app.store.insert(device, os_name, rows, now)
+        except sqlite3.Error as e:
+            log(f"database: {e}")
+            return self.send(503, "the database can't be written")
+        return self.send_json({"ok": True, "inserted": inserted, "duplicates": len(rows) - inserted,
+                               "rejected": rejected})
+
+    # -- reads --
+
+    def get_devices(self, q):
+        store = self.app.store
+        out = []
+        for d in store.devices():
+            if q.get("device") is not None and d["device"] != q["device"]:
+                continue
+            out.append(d)
+        return self.send_json({"devices": out, "now": time.time()})
+
+    def get_activity(self, q):
+        since, until = time_range(q, MAX_RANGE_S)
+        try:
+            limit = max(1, min(int(q.get("limit", 2000)), 20000))
+        except ValueError:
+            raise BadQuery("limit must be a number") from None
+        names = self.app.device_names(q.get("device"))
+        rows = self.app.store.newest(names, since, until, limit) if names else []
+        keys = ("id", "device", "type", "app", "title", "url", "domain", "ts_start", "ts_end", "duration")
+        return self.send_json({"events": [dict(zip(keys, r)) for r in rows]})
+
+    def get_summary(self, q):
+        """The first dashboard's totals for one device, kept for anything that still reads them."""
+        since, until = time_range(q, MAX_RANGE_S)
+        name = q.get("device")
+        if not name:
+            raise BadQuery("give device=")
+        day = Day(self.app.store.rows(name, since, until), since, until, lambda k, n: None).answer(timeline=False)
+        return self.send_json({
+            "apps": [{"name": n, "seconds": s} for n, s in day["apps"]],
+            "domains": [{"name": n, "seconds": s} for n, s in day["sites"]],
+            "totals": {"app_seconds": day["totals"].get("app", 0), "web_seconds": day["totals"].get("web", 0),
+                       "afk_seconds": day["totals"].get("idle", 0), "first_ts": day["first"], "last_ts": day["last"]},
+        })
+
+    def serve_web(self, path):
+        name = "index.html" if path in ("", "/") else path.lstrip("/")
+        if not WEB_NAME.fullmatch(name) or ".." in name:
+            return self.send(404, "not found")
+        ctype = WEB_TYPES.get(os.path.splitext(name)[1])
+        full = os.path.join(self.app.web, name)
+        stamp = file_stamp(full) if ctype else None
+        if stamp is None:
+            return self.send(404, "not found")
+        hit = self.app.pages.get(name)
+        if not hit or hit[0] != stamp:
+            with open(full, "rb") as f:
+                body = f.read()
+            if name == "index.html":
+                # Every path the page uses is relative to this, so it works under any prefix.
+                body = body.replace(b'<base href="/xrnmoni/">', f'<base href="{self.app.prefix}/">'.encode())
+            hit = (stamp, '"' + hashlib.sha256(body).hexdigest()[:16] + '"', body)
+            self.app.pages[name] = hit
+        if self.headers.get("If-None-Match") == hit[1]:
+            return self.send(304, headers={"ETag": hit[1]}, cache="no-cache")
+        return self.send(200, hit[2], ctype, {"ETag": hit[1]}, cache="no-cache")
+
+
+class BadQuery(ValueError):
+    pass
+
+
+def time_range(q, limit):
+    """(since, until) from a query, the last day when it names none."""
+    now = time.time()
+    try:
+        since = float(q.get("since", now - 86400))
+        until = float(q.get("until", now))
+    except ValueError:
+        raise BadQuery("since and until must be numbers") from None
+    if not (math.isfinite(since) and math.isfinite(until)) or until <= since or until - since > limit:
+        raise BadQuery(f"until must come after since, at most {int(limit // 86400)} days later")
+    return since, until
+
+
+class Server(ThreadingHTTPServer):
+    """Quiet about callers that hang up: one line, not socketserver's traceback."""
+
+    daemon_threads = True
+    # On Windows SO_REUSEADDR lets a second copy bind the same port and take half the requests.
+    allow_reuse_address = sys.platform != "win32"
+
+    def handle_error(self, request, client_address):
+        error = sys.exc_info()[1]
+        if isinstance(error, (ConnectionError, TimeoutError)):
+            log(f"{client_address[0]} connection dropped: {error!r}")
+            return
+        if sys.stderr is not None:
+            super().handle_error(request, client_address)
+
+
+# ---- command line -------------------------------------------------------------------------------
+
+def users_file(args):
+    return os.path.abspath(os.path.expanduser(args.users)) if args.users else os.path.join(args.data, "users")
+
+
+def read_password():
+    if sys.stdin is not None and sys.stdin.isatty():
+        import getpass
+        first = getpass.getpass("Password: ")
+        if first != getpass.getpass("Again: "):
+            sys.exit("the two passwords differ")
+        return first
+    return (sys.stdin.readline() if sys.stdin else "").rstrip("\r\n")
+
+
+def user_cli(argv):
+    p = argparse.ArgumentParser(prog="xrnmoni.py user", description="Who can sign in to the dashboard.")
+    p.add_argument("action", choices=("add", "remove", "list"))
+    p.add_argument("name", nargs="?")
+    p.add_argument("--data", required=True)
+    p.add_argument("--users", help="an htpasswd file of bcrypt hashes (default: DIR/users)")
+    args = p.parse_args(argv)
+    args.data = os.path.abspath(os.path.expanduser(args.data))
+    os.makedirs(args.data, mode=0o700, exist_ok=True)
+    path = users_file(args)
+    if args.action == "list":
+        for i, name in enumerate(read_names(path)):
+            print(name + ("  (owner)" if i == 0 else ""))
+        return
+    if not args.name or not USER_NAME.fullmatch(args.name):
+        sys.exit("give a name of letters, digits, . _ or -, starting with a letter or digit")
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        lines = []
+    others = [line for line in lines if line.partition(":")[0] != args.name]
+    if args.action == "remove":
+        if len(others) == len(lines):
+            sys.exit(f"{args.name} isn't in {path}")
+        write_private(path, "".join(line + "\n" for line in others))
+        print(f"Removed {args.name}.", file=sys.stderr)
+        return
+    password = read_password()
+    if len(password) < 8:
+        sys.exit("use a password of 8 characters or more")
+    import bcrypt
+    hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    kept = [line if line.partition(":")[0] != args.name else f"{args.name}:{hashed}" for line in lines]
+    if len(others) == len(lines):
+        kept.append(f"{args.name}:{hashed}")
+    write_private(path, "".join(line + "\n" for line in kept))
+    print(f"{args.name} can sign in{'' if read_names(path)[0] == args.name else ' once named with --viewer'}.",
+          file=sys.stderr)
+
+
+def token_cli(argv):
+    p = argparse.ArgumentParser(prog="xrnmoni.py token", description="Device tokens, which agents post with.")
+    p.add_argument("action", choices=("add", "list", "revoke"))
+    p.add_argument("what", nargs="?", help="add: the device's name, as the dashboard shows it; revoke: the id")
+    p.add_argument("--data", required=True)
+    args = p.parse_args(argv)
+    data = os.path.abspath(os.path.expanduser(args.data))
+    os.makedirs(data, mode=0o700, exist_ok=True)
+    store = Tokens(os.path.join(data, "tokens.json"))
+    if args.action == "add":
+        if not args.what:
+            sys.exit("give the device a name, such as: token add laptop")
+        try:
+            text = store.add(args.what)
+        except ValueError as e:
+            sys.exit(str(e))
+        print(text)
+        print(f"Put it in that device's agent config as token. It isn't shown again; revoke it with: "
+              f"token revoke {text[8:16]}", file=sys.stderr)
+    elif args.action == "list":
+        for t in store.read():
+            made = time.strftime("%Y-%m-%d %H:%M", time.localtime(t.get("created", 0)))
+            print(f"{t.get('id')}  {made}  {t.get('device')}")
+    else:
+        if not args.what or not TOKEN_ID.fullmatch(args.what):
+            sys.exit("give the id that `token list` shows")
+        if not store.revoke(args.what):
+            sys.exit(f"no token {args.what}")
+        print(f"Revoked {args.what}.", file=sys.stderr)
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    os.umask(0o077)
+    if argv[:1] == ["user"]:
+        return user_cli(argv[1:])
+    if argv[:1] == ["token"]:
+        return token_cli(argv[1:])
+    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    p.add_argument("--host", default="127.0.0.1", help="the address to listen on (0.0.0.0: every one)")
+    p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p.add_argument("--data", required=True, help="where the database, tokens and rules live")
+    p.add_argument("--users", help="an htpasswd file of bcrypt hashes to sign in with (default: DIR/users)")
+    p.add_argument("--viewer", action="append", default=[],
+                   help="another user in the users file who may see the dashboard (the first always may)")
+    p.add_argument("--prefix", default=PREFIX, help="the path a reverse proxy publishes it under")
+    p.add_argument("--retain-days", type=int, default=RETAIN_DAYS, help="events older than this go; 0 keeps all")
+    p.add_argument("--web", help="the dashboard's folder (default: web/ beside this file)")
+    args = p.parse_args(argv)
+    args.data = os.path.abspath(os.path.expanduser(args.data))
+    os.makedirs(args.data, mode=0o700, exist_ok=True)
+    if sys.stderr is None:  # pythonw, or a task with no console
+        sys.stderr = LogFile(os.path.join(args.data, "xrnmoni.log"))
+    if sys.stdout is None:
+        sys.stdout = sys.stderr
+    prefix = "/" + args.prefix.strip("/") if args.prefix.strip("/") else ""
+    app = App(args.data, users_file(args), os.path.expanduser(args.web) if args.web else None, prefix,
+              max(0, args.retain_days), args.viewer)
+    Handler.app = app
+    try:
+        srv = Server((args.host, args.port), Handler)
+    except OSError as e:
+        log(f"can't listen on {args.host}:{args.port}: {e}")
+        sys.exit(1)
+    threading.Thread(target=app.pruner, daemon=True).start()
+    if not read_names(app.users):
+        log(f"no one can sign in yet: python3 xrnmoni.py user add NAME --data {args.data}"
+            + (f" --users {app.users}" if args.users else ""))
+    log(f"xrnmoni on http://{args.host}:{args.port}, data in {args.data}")
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

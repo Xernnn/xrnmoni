@@ -30,7 +30,10 @@ jobs:
             agent/requirements.txt
 
       - name: Install dependencies
-        run: pip install -r server/requirements.txt -r agent/requirements.txt httpx
+        run: pip install -r server/requirements.txt -r agent/requirements.txt
+
+      - name: Server tests
+        run: python -m unittest server/test_xrnmoni.py
 
       - name: Tests
         run: python -m unittest discover tests
