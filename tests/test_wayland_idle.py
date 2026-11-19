@@ -188,15 +188,18 @@ class LogindIdleTest(unittest.TestCase):
         with open(busctl, "w") as f:
             f.write(script)
         os.chmod(busctl, stat.S_IRWXU)
-        old_path, old_wl = os.environ["PATH"], os.environ.get("WAYLAND_DISPLAY")
-        os.environ["PATH"] = self.bin + os.pathsep + old_path
+        saved_env = {k: os.environ.get(k) for k in ("PATH", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR")}
+        os.environ["PATH"] = self.bin + os.pathsep + saved_env["PATH"]
         os.environ.pop("WAYLAND_DISPLAY", None)
+        os.environ["XDG_RUNTIME_DIR"] = self.bin  # no compositor socket in here
         saved = dict(pl._IDLE)
 
         def restore():
-            os.environ["PATH"] = old_path
-            if old_wl is not None:
-                os.environ["WAYLAND_DISPLAY"] = old_wl
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
             pl._IDLE.clear()
             pl._IDLE.update(saved)
         self.addCleanup(restore)
@@ -206,9 +209,10 @@ class LogindIdleTest(unittest.TestCase):
         self.assertEqual(session, "/org/freedesktop/login1/session/_32")
         self.assertAlmostEqual(pl.logind_idle_seconds(session), 120, delta=2)
         pl._IDLE.clear()
-        pl._IDLE["source"] = None
-        pl._MODE = "none"
-        self.addCleanup(setattr, pl, "_MODE", None)
+        pl._IDLE.update(source=None, at=0.0)
+        detect = pl._detect
+        pl._detect = lambda: "none"
+        self.addCleanup(setattr, pl, "_detect", detect)
         self.assertEqual(pl._pick_idle_source(), "logind")
         self.assertAlmostEqual(pl.get_idle_seconds(), 120, delta=2)
 

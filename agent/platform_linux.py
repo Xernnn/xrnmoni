@@ -2,7 +2,10 @@
 
 Supports two environments, auto-detected:
   * X11        — via python-xlib (EWMH). Idle via `xprintidle` if installed.
-  * Hyprland   — via `hyprctl activewindow -j` (Wayland).
+  * Hyprland   — via its IPC sockets (Wayland): focus changes arrive as events on
+                 .socket2.sock, so even a one-second switch is seen; .socket.sock is
+                 asked directly when the event socket is down. An agent started before
+                 Hyprland (no HYPRLAND_INSTANCE_SIGNATURE yet) finds it later.
 
 Idle, first that works: the Wayland ext-idle-notify-v1 protocol (Hyprland, Sway,
 KDE...; a small client below speaks the wire protocol, no dependencies),
@@ -30,8 +33,11 @@ import time
 NAME = "none"
 
 _MODE = None
+_last_detect = 0.0
+REDETECT_SECONDS = 5.0
 _display = None
 _atoms = {}
+_HYPR = {"instance": None, "events": None}
 
 
 def _init_x11():
@@ -47,10 +53,19 @@ def _init_x11():
 
 
 def _detect():
-    global _MODE
-    if _MODE is not None:
+    """Which window backend to use. "none" is retried every REDETECT_SECONDS, so an
+    agent started before the desktop picks it up once it's there."""
+    global _MODE, _last_detect
+    if _MODE not in (None, "none"):
         return _MODE
-    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") and shutil.which("hyprctl"):
+    if _MODE == "none" and time.time() - _last_detect < REDETECT_SECONDS:
+        return _MODE
+    _last_detect = time.time()
+    instance = hypr_instance_dir()
+    if instance:
+        _HYPR["instance"] = instance
+        _HYPR["events"] = HyprEvents(instance)
+        _HYPR["events"].start()
         _MODE = "hyprland"
         globals()["NAME"] = "hyprland"
     elif os.environ.get("DISPLAY"):
@@ -58,7 +73,8 @@ def _detect():
             _init_x11()
             _MODE = "x11"
         except Exception as e:
-            print(f"[linux] X11 init failed: {e}", flush=True)
+            if _MODE is None:
+                print(f"[linux] X11 init failed: {e}", flush=True)
             _MODE = "none"
     else:
         _MODE = "none"
@@ -119,17 +135,135 @@ def _x11_idle():
 
 
 # ---- Hyprland --------------------------------------------------------------
-def _hypr_active_window():
+def _runtime_dir(env=os.environ):
+    return env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+
+
+def _hypr_request(instance, command):
+    """Ask Hyprland's request socket (what hyprctl does), e.g. b"j/activewindow"."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(2)
+        s.connect(os.path.join(instance, ".socket.sock"))
+        s.sendall(command)
+        out = b""
+        while True:
+            data = s.recv(65536)
+            if not data:
+                return out
+            out += data
+
+
+def hypr_instance_dir(env=os.environ):
+    """The running Hyprland's socket folder: $HYPRLAND_INSTANCE_SIGNATURE's, else the
+    newest live one under $XDG_RUNTIME_DIR/hypr (the environment of an agent started
+    before Hyprland, or across a Hyprland restart, doesn't name it)."""
+    base = os.path.join(_runtime_dir(env), "hypr")
+    found = []
     try:
-        out = subprocess.run(
-            ["hyprctl", "activewindow", "-j"], capture_output=True, text=True, timeout=2
-        )
-        data = json.loads(out.stdout or "{}")
+        found = sorted((os.path.join(base, d) for d in os.listdir(base)),
+                       key=lambda d: os.path.getmtime(d), reverse=True)
+    except OSError:
+        pass
+    sig = env.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if sig:
+        found.insert(0, os.path.join(base, sig))
+    for d in found:
+        try:
+            _hypr_request(d, b"j/version")
+            return d
+        except OSError:
+            continue
+    return None
+
+
+def _hypr_active_window(instance=None):
+    try:
+        data = json.loads(_hypr_request(instance or _HYPR["instance"], b"j/activewindow")
+                          or b"{}")
         if not data:
             return None, None
         return (data.get("class") or "unknown"), (data.get("title") or "")
     except Exception:
         return None, None
+
+
+def parse_hypr_event(line):
+    """A .socket2.sock line -> ("window", (class, title)) | ("address", addr) | None."""
+    event, sep, data = line.partition(">>")
+    if not sep:
+        return None
+    if event == "activewindow":
+        cls, _, title = data.partition(",")
+        if not cls and not title:
+            return "window", (None, None)
+        return "window", (cls or "unknown", title)
+    if event == "activewindowv2":
+        return "address", data
+    return None
+
+
+class HyprEvents:
+    """Follows Hyprland's event socket for the focused window.
+
+    Hyprland sends activewindow (class, title) and then activewindowv2 (address) when
+    focus moves and when the focused window's title changes. Only a new address wakes
+    the agent at once; a title change waits for the next regular sample,
+    so a terminal animating its title doesn't make an interval per frame."""
+
+    def __init__(self, instance, on_change=None):
+        self.instance = instance
+        self.on_change = on_change
+        self.window = (None, None)
+        self.address = None
+        self.connected = False
+
+    def _notify(self):
+        callback = self.on_change or _settings["on_change"]
+        if callback:
+            callback()
+
+    def feed(self, line):
+        got = parse_hypr_event(line)
+        if not got:
+            return
+        kind, value = got
+        if kind == "window":
+            self.window = value
+            if value == (None, None):
+                self.address = None
+                self._notify()
+        elif value != self.address:
+            self.address = value
+            self._notify()
+
+    def run(self):
+        while True:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.connect(os.path.join(self.instance, ".socket2.sock"))
+                self.window = _hypr_active_window(self.instance)  # focus before we listened
+                self.connected = True
+                self._notify()
+                buf = b""
+                while True:
+                    data = sock.recv(65536)
+                    if not data:
+                        break
+                    *lines, buf = (buf + data).split(b"\n")
+                    for line in lines:
+                        self.feed(line.decode("utf-8", "replace"))
+            except OSError:
+                pass
+            finally:
+                sock.close()
+            self.connected = False
+            time.sleep(2)
+            # Hyprland restarted: it has a new instance signature
+            self.instance = hypr_instance_dir() or self.instance
+            _HYPR["instance"] = self.instance
+
+    def start(self):
+        threading.Thread(target=self.run, daemon=True, name="hyprland-events").start()
 
 
 # ---- Wayland wire protocol -------------------------------------------------
@@ -186,10 +320,16 @@ def wl_args(body, signature):
 
 
 def wayland_socket_path(env=os.environ):
-    name = env.get("WAYLAND_DISPLAY") or "wayland-0"
-    if os.path.isabs(name):
-        return name
-    return os.path.join(env.get("XDG_RUNTIME_DIR", ""), name)
+    """$WAYLAND_DISPLAY's socket, else the first wayland-N socket in the runtime dir."""
+    name = env.get("WAYLAND_DISPLAY")
+    if name:
+        return name if os.path.isabs(name) else os.path.join(_runtime_dir(env), name)
+    try:
+        names = sorted(n for n in os.listdir(_runtime_dir(env))
+                       if re.fullmatch(r"wayland-\d+", n))
+    except OSError:
+        names = []
+    return os.path.join(_runtime_dir(env), names[0]) if names else None
 
 
 class WaylandIdle:
@@ -425,7 +565,7 @@ class LogindWatcher:
 
 
 # ---- idle source -------------------------------------------------------------
-_IDLE = {"source": None}
+_IDLE = {"source": None, "at": 0.0}
 _settings = {"afk_threshold": 60.0, "on_change": None}
 
 
@@ -435,6 +575,7 @@ def configure(afk_threshold=None, on_change=None):
     if afk_threshold is not None:
         _settings["afk_threshold"] = float(afk_threshold)
     _settings["on_change"] = on_change
+    _detect()
     _pick_idle_source()
     _start_logind()
 
@@ -460,29 +601,39 @@ def _start_logind():
 
 
 def _pick_idle_source():
-    if _IDLE["source"] is not None:
+    """The first idle source that works. Anything but Wayland is looked at again every
+    30 s, so an agent started before the compositor switches to it."""
+    if _IDLE["source"] == "wayland" or (
+            _IDLE["source"] is not None and time.time() - _IDLE["at"] < 30):
         return _IDLE["source"]
-    why = []
-    if os.environ.get("WAYLAND_DISPLAY") and hasattr(socket, "AF_UNIX"):
-        client = WaylandIdle(_settings["afk_threshold"], on_change=_settings["on_change"])
+    _IDLE["at"] = time.time()
+    source, why = None, []
+    path = wayland_socket_path() if hasattr(socket, "AF_UNIX") else None
+    if path:
+        client = WaylandIdle(_settings["afk_threshold"], path=path,
+                             on_change=_settings["on_change"])
         if client.start():
-            _IDLE.update(source="wayland", client=client)
-            print(f"[linux] idle: Wayland ext-idle-notify ({_settings['afk_threshold']:g} s)",
-                  flush=True)
-            return "wayland"
-        why.append(f"Wayland: {client.error}")
-    session = shutil.which("busctl") and logind_session_path()
-    if _detect() == "x11" and shutil.which("xprintidle"):
-        _IDLE["source"] = "xprintidle"
-    elif session:
-        _IDLE.update(source="logind", session=session)
-    else:
-        _IDLE["source"] = "none"
-    names = {"xprintidle": "xprintidle", "logind": "logind IdleHint",
-             "none": "none, nothing will be marked idle"}
-    print(f"[linux] idle: {names[_IDLE['source']]}" + (f" ({'; '.join(why)})" if why else ""),
-          flush=True)
-    return _IDLE["source"]
+            _IDLE["client"] = client
+            source = "wayland"
+        else:
+            why.append(f"Wayland: {client.error}")
+    if source is None:
+        session = shutil.which("busctl") and logind_session_path()
+        if _detect() == "x11" and shutil.which("xprintidle"):
+            source = "xprintidle"
+        elif session:
+            source = "logind"
+            _IDLE["session"] = session
+        else:
+            source = "none"
+    if source != _IDLE["source"]:
+        names = {"wayland": f"Wayland ext-idle-notify ({_settings['afk_threshold']:g} s)",
+                 "xprintidle": "xprintidle", "logind": "logind IdleHint",
+                 "none": "none, nothing will be marked idle"}
+        print(f"[linux] idle: {names[source]}" + (f" ({'; '.join(why)})" if why else ""),
+              flush=True)
+    _IDLE["source"] = source
+    return source
 
 
 # ---- public API ------------------------------------------------------------
@@ -491,8 +642,20 @@ def get_active_window():
     if mode == "x11":
         return _x11_active_window()
     if mode == "hyprland":
+        events = _HYPR["events"]
+        if events and events.connected:
+            return events.window
         return _hypr_active_window()
     return None, None
+
+
+def describe():
+    """For the agent's banner: the backends actually in use."""
+    mode = _detect()
+    events = _HYPR["events"]
+    window = {"hyprland": "hyprland (event socket)" if events and events.connected
+              else "hyprland (request socket)", "x11": "x11"}.get(mode, "none (retrying)")
+    return f"{window}, idle={_pick_idle_source()}"
 
 
 def is_locked():

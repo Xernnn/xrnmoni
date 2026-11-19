@@ -502,6 +502,12 @@ class Tracker:
             self.wake.wait(self.cfg.poll_interval)
 
 
+def describe_backend(platform):
+    """The backend in use, for the banner (NAME alone is set only once detected)."""
+    describe = getattr(platform, "describe", None)
+    return describe() if describe else platform.NAME
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=os.path.join(os.path.dirname(__file__), "config.toml"))
@@ -534,7 +540,7 @@ def main():
             signal.signal(getattr(signal, name), on_signal)
 
     print(
-        f"[xrnmoni] device={cfg.device} os={OS_NAME} backend={backend.NAME} "
+        f"[xrnmoni] device={cfg.device} os={OS_NAME} backend={describe_backend(backend)} "
         f"-> {cfg.server_url} (bridge :{bridge.server_address[1]})",
         flush=True,
     )
