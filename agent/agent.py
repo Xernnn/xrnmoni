@@ -23,6 +23,7 @@ import sys
 import time
 import json
 import re
+import signal
 import socket
 import sqlite3
 import threading
@@ -361,67 +362,100 @@ class _BridgeHandler(BaseHTTPRequestHandler):
         pass
 
 
-def run_tracker(cfg, sender):
-    """Main sampling loop: foreground window + idle."""
-    cur = None  # {"app", "title", "start"}
-    afk_start = None
+CHUNK = 60.0  # the longest interval the agent sends
 
-    def close_app_interval(end):
-        nonlocal cur
+
+def pieces(start, end):
+    """[start, end] cut into consecutive pieces of at most CHUNK seconds."""
+    out = []
+    while start < end:
+        stop = min(end, start + CHUNK)
+        out.append((start, stop))
+        start = stop
+    return out
+
+
+class Tracker:
+    """Samples the foreground window and idle time and turns them into intervals.
+
+    The open interval is sent in closed chunks of CHUNK seconds as it goes, so an
+    hour in one window shows up minute by minute, and a crash loses at most the
+    current minute. close() ends it at "now" (on shutdown)."""
+
+    def __init__(self, cfg, put_many, backend, now=time.time):
+        self.cfg = cfg
+        self.put_many = put_many
+        self.backend = backend
+        self.now = now
+        # the open interval; "start" is where its unsent part begins
+        self.cur = None  # {"type", "app", "title", "start"}
+        self.wake = threading.Event()
+
+    def _emit(self, cur, end):
+        events = []
+        for a, b in pieces(cur["start"], end):
+            e = {"id": new_id(), "type": cur["type"], "ts_start": a, "ts_end": b,
+                 "duration": b - a}
+            if cur["type"] == "app":
+                e["app"], e["title"] = cur["app"], cur["title"]
+            events.append(e)
+        if events:
+            self.put_many(events)
+
+    def _close(self, end):
+        cur, self.cur = self.cur, None
         if cur and end > cur["start"]:
-            sender.put(
-                {
-                    "type": "app",
-                    "app": cur["app"],
-                    "title": cur["title"],
-                    "ts_start": cur["start"],
-                    "ts_end": end,
-                    "duration": end - cur["start"],
-                }
-            )
-        cur = None
+            self._emit(cur, end)
 
-    while True:
-        now = time.time()
+    def _open(self, kind, start, app=None, title=None):
+        self.cur = {"type": kind, "app": app, "title": title, "start": start}
+
+    def tick(self):
+        now = self.now()
+        cur = self.cur
         try:
-            idle = backend.get_idle_seconds()
+            idle = self.backend.get_idle_seconds()
         except Exception:
             idle = 0.0
 
-        if idle >= cfg.afk_threshold:
-            # user is away: close any open app interval, open/extend an afk interval
-            if cur:
-                close_app_interval(now - idle)  # app ended when input stopped
-            if afk_start is None:
-                afk_start = now - idle
-            time.sleep(cfg.poll_interval)
-            continue
+        if idle >= self.cfg.afk_threshold:
+            # away: the app interval ended when input stopped
+            if not cur or cur["type"] != "afk":
+                since = now - idle
+                self._close(max(since, cur["start"]) if cur else since)
+                self._open("afk", since)
+        else:
+            if cur and cur["type"] == "afk":
+                self._close(now)
+                cur = None
+            try:
+                app, title = self.backend.get_active_window()
+            except Exception as e:
+                app, title = None, None
+                log(f"[tracker] active-window error: {e}")
+            if app is None:
+                self._close(now)
+            elif cur is None or cur["app"] != app or cur["title"] != title:
+                self._close(now)
+                self._open("app", now, app, title)
 
-        # user is active again -> flush afk interval
-        if afk_start is not None:
-            sender.put(
-                {
-                    "type": "afk",
-                    "ts_start": afk_start,
-                    "ts_end": now,
-                    "duration": now - afk_start,
-                }
-            )
-            afk_start = None
+        cur = self.cur
+        if cur and now - cur["start"] >= CHUNK:
+            end = cur["start"] + (now - cur["start"]) // CHUNK * CHUNK
+            self._emit(cur, end)
+            cur["start"] = end
 
-        try:
-            app, title = backend.get_active_window()
-        except Exception as e:
-            app, title = None, None
-            print(f"[tracker] active-window error: {e}", flush=True)
+    def close(self):
+        self._close(self.now())
 
-        if app is None:
-            close_app_interval(now)
-        elif cur is None or cur["app"] != app or cur["title"] != title:
-            close_app_interval(now)
-            cur = {"app": app, "title": title, "start": now}
-
-        time.sleep(cfg.poll_interval)
+    def run(self, stop):
+        while not stop.is_set():
+            self.wake.clear()
+            try:
+                self.tick()
+            except Exception as e:
+                log(f"[tracker] error: {e!r}")
+            self.wake.wait(self.cfg.poll_interval)
 
 
 def main():
@@ -439,14 +473,28 @@ def main():
     bridge = BrowserBridge(cfg, sender)
     threading.Thread(target=bridge.serve_forever, daemon=True).start()
 
+    tracker = Tracker(cfg, sender.put_many, backend)
+    stop = threading.Event()
+
+    def on_signal(signum, frame):
+        stop.set()
+        tracker.wake.set()
+
+    # systemd stops with SIGTERM, a terminal with SIGINT/SIGHUP: in every case close the
+    # open interval at "now" and put it in the spool before exiting
+    for name in ("SIGTERM", "SIGINT", "SIGHUP"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), on_signal)
+
     print(
         f"[xrnmoni] device={cfg.device} os={OS_NAME} backend={backend.NAME} "
-        f"-> {cfg.server_url} (bridge :{cfg.bridge_port})",
+        f"-> {cfg.server_url} (bridge :{bridge.server_address[1]})",
         flush=True,
     )
     try:
-        run_tracker(cfg, sender)
-    except KeyboardInterrupt:
+        tracker.run(stop)
+    finally:
+        tracker.close()
         sender.put({"type": "shutdown", "ts_start": time.time()})
         sender.stop()
 
