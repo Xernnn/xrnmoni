@@ -1,4 +1,4 @@
-"""Linux backend: foreground window + idle time.
+"""Linux backend: foreground window, idle time, lock and sleep.
 
 Supports two environments, auto-detected:
   * X11        — via python-xlib (EWMH). Idle via `xprintidle` if installed.
@@ -216,6 +216,7 @@ class HyprEvents:
         self.window = (None, None)
         self.address = None
         self.connected = False
+        self._tried = threading.Event()
 
     def _notify(self):
         callback = self.on_change or _settings["on_change"]
@@ -243,6 +244,7 @@ class HyprEvents:
                 sock.connect(os.path.join(self.instance, ".socket2.sock"))
                 self.window = _hypr_active_window(self.instance)  # focus before we listened
                 self.connected = True
+                self._tried.set()
                 self._notify()
                 buf = b""
                 while True:
@@ -257,13 +259,17 @@ class HyprEvents:
             finally:
                 sock.close()
             self.connected = False
+            self._tried.set()
             time.sleep(2)
             # Hyprland restarted: it has a new instance signature
             self.instance = hypr_instance_dir() or self.instance
             _HYPR["instance"] = self.instance
 
-    def start(self):
+    def start(self, wait=1.0):
+        """Start listening; wait up to `wait` s for the first connection, so what the
+        agent reports at start (and its banner) is already the event socket."""
         threading.Thread(target=self.run, daemon=True, name="hyprland-events").start()
+        self._tried.wait(wait)
 
 
 # ---- Wayland wire protocol -------------------------------------------------

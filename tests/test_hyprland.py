@@ -150,6 +150,14 @@ class HyprlandBackendTest(unittest.TestCase):
             pl.get_active_window()
         self.assertEqual(len(hypr.requests), asked)  # no polling while events flow
 
+    def test_the_event_socket_is_up_once_detected(self):
+        # the banner is printed right after detection and should name what is in use
+        hypr = FakeHyprland(self.runtime)
+        self.addCleanup(hypr.close)
+        self.assertEqual(pl._detect(), "hyprland")
+        self.assertTrue(pl._HYPR["events"].connected)
+        self.assertTrue(pl.describe().startswith("hyprland (event socket)"))
+
     def test_a_dead_instance_folder_is_skipped(self):
         os.makedirs(os.path.join(self.runtime, "hypr", "stale_1_1"))
         self.assertIsNone(pl.hypr_instance_dir())
