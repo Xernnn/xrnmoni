@@ -6,7 +6,7 @@
 # Needs Python 3.10+ on the machine that builds (here, or CI's windows job). Writes
 #   windows\dist\xrnmoni-agent\          the exe and its _internal folder
 #   windows\dist\xrnmoni-windows\        that, the windows scripts and the extension:
-#                                        copy it to the PC and run windows\install.bat -UseExe
+#                                        copy it to the PC and run windows\install.bat there
 [CmdletBinding()]
 param([string]$Python)
 
@@ -48,4 +48,5 @@ Get-ChildItem -Path (Join-Path $PSScriptRoot '*') -File -Include '*.ps1', '*.bat
     Copy-Item -Destination (Join-Path $pkg 'windows')
 Copy-Item -Recurse (Join-Path $root 'extension') (Join-Path $pkg 'extension')
 Write-Host "`nBuilt $exe" -ForegroundColor Green
-Write-Host "Copy $pkg to the PC and run windows\install.bat -UseExe there."
+Write-Host "Copy $pkg to the PC and run windows\install.bat there (it installs the exe)."
+exit 0
