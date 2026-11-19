@@ -68,6 +68,24 @@ more random characters (`python -c "import secrets; print(secrets.token_urlsafe(
 
 ## 2. Agent (on each monitored machine)
 
+**Linux** (systemd user service):
+
+```bash
+linux/install.sh
+```
+
+It makes a venv (`agent/.venv`), copies the example config to
+`~/.config/xrnmoni/agent.toml` if there is none (with a fresh `bridge_secret`, which it
+prints for the extension), and installs and enables the user unit
+`xrnmoni-agent.service`. The unit starts with the graphical session and stops with it
+(`WantedBy`/`PartOf=graphical-session.target`), so Hyprland's and Wayland's sockets are
+there when it starts; it restarts on a crash. Edit the config, then
+`systemctl --user start xrnmoni-agent`; the log is
+`journalctl --user -u xrnmoni-agent -f`. Run `install.sh` again after pulling to
+update; it keeps the config and restarts the agent.
+
+**By hand** (any platform):
+
 ```bash
 cd agent
 python -m venv .venv && . .venv/bin/activate      # Windows: .venv\Scripts\activate
@@ -76,36 +94,49 @@ cp config.example.toml config.toml                # then edit server_url + token
 python agent.py --config config.toml
 ```
 
-Set `server_url` to the hub's LAN IP (e.g. `http://192.168.1.10:8000`) and
-`token` to the same secret. `device` is the friendly name shown in the dashboard.
+Set `server_url` to the hub's LAN IP (e.g. `http://192.168.1.10:8000`), or a URL with
+a path if the server sits behind a proxy (`https://host/xrnmoni`), and `token` to the
+same secret. `device` is the friendly name shown in the dashboard.
+
+**What it records, and how it survives trouble**
+
+- The foreground window (`app`), idle time (`idle`: no input for `afk_threshold`
+  seconds), the locked screen (`locked`) and sleep (`sleep`). One at a time: sleep
+  beats locked, locked beats idle, idle beats the window.
+- Intervals are sent as closed chunks of at most 60 s while they last, so a long stay
+  shows up within a minute.
+- Every event goes into a SQLite spool (`spool_path`, default
+  `~/.local/state/xrnmoni/spool.sqlite`, `%LOCALAPPDATA%\xrnmoni\` on Windows) when it
+  is made, and is deleted only after the server took it. A server outage, a restart or
+  a crash loses nothing but the current minute; SIGTERM (systemd stop), Ctrl-C and
+  SIGHUP close the open interval first. Each event has an id, so a resend is not
+  counted twice. Events the server refuses are logged and dropped; the spool is
+  capped by `spool_max_days` / `spool_max_rows`, oldest first.
+- A suspend (or the agent being stopped) is noticed when the loop wakes to more wall
+  time than it slept: the gap is recorded as `sleep`, not as time in the last window.
 
 **Platform notes**
 
 - **Windows** — foreground app + idle work out of the box (pywin32).
-- **Linux / X11** — active window via python-xlib. For idle/AFK detection,
-  install `xprintidle` (`sudo pacman -S xprintidle` on CachyOS/Arch). Without it,
-  app tracking still works but nothing is ever marked idle.
-- **Linux / Hyprland (Wayland)** — active window via `hyprctl`; auto-detected.
-  Idle detection isn't available on Wayland, so `afk_threshold` has no effect.
+- **Linux / Hyprland (Wayland)** — the focused window comes from Hyprland's event
+  socket, so even short switches are seen; auto-detected, also when the agent started
+  before Hyprland. Idle comes from the Wayland idle protocol (ext-idle-notify): the
+  agent asks the compositor to tell it after `afk_threshold` seconds without input. It
+  only listens and never keeps the screen awake; a video that keeps the screen on
+  counts as being there. The lock screen is seen through logind and Hyprland's
+  lock-notify protocol (hyprlock, the Omarchy/Quickshell lock, swaylock), and sleep
+  through logind. The log's first lines say which sources are in use.
+- **Linux / X11** — active window via python-xlib. For idle detection, install
+  `xprintidle` (`sudo pacman -S xprintidle` on CachyOS/Arch); without it the agent
+  falls back to logind's idle hint, which many desktops never set.
 - **Other Wayland (GNOME/KDE)** — compositors don't expose the active window to
   unprivileged clients; the agent logs "unknown". Use an X11 session, or extend
-  `platform_linux.py` with a GNOME-extension / KWin-script bridge.
+  `platform_linux.py` with a GNOME-extension / KWin-script bridge. Idle works where
+  the compositor has ext-idle-notify (KDE does).
 
 **Run it on boot**
 
-- Linux (systemd user service):
-  ```ini
-  # ~/.config/systemd/user/xrnmoni.service
-  [Unit]
-  Description=xrnmoni agent
-  [Service]
-  ExecStart=%h/Documents/Projects/xrnmoni/agent/.venv/bin/python %h/Documents/Projects/xrnmoni/agent/agent.py --config %h/Documents/Projects/xrnmoni/agent/config.toml
-  Restart=always
-  [Install]
-  WantedBy=default.target
-  ```
-  `systemctl --user enable --now xrnmoni` (and `loginctl enable-linger $USER`
-  so it runs without an active graphical login if you want).
+- Linux: `linux/install.sh`, above.
 - Windows: Task Scheduler → "At log on" → run `pythonw.exe agent.py`.
 
 ## 3. Browser extension (for live website tracking)
@@ -149,13 +180,16 @@ so at most ~30s is ever lost on suspension.
 
 ## Data model
 
-All events land in one `events` table:
+All events land in one `events` table. Each carries an `id` (32 hex characters)
+that the agent gives it, and intervals are at most 60 s long:
 
 | type       | meaning                                    | fields used                     |
 |------------|--------------------------------------------|---------------------------------|
 | `app`      | foreground window interval                 | app, title, ts_start/end, dur   |
 | `browser`  | active-tab interval (from extension)       | url, title, domain, …, dur      |
-| `afk`      | idle interval                              | ts_start/end, duration          |
+| `idle`     | no input for `afk_threshold` s (was `afk`) | ts_start/end, duration          |
+| `locked`   | screen locked                              | ts_start/end, duration          |
+| `sleep`    | machine asleep, or the agent not running   | ts_start/end, duration          |
 | `boot`     | machine boot time (point event)            | ts_start                        |
 | `shutdown` | agent stopping (point event)               | ts_start                        |
 
