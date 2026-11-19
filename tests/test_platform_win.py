@@ -339,6 +339,15 @@ class InterruptMainTest(unittest.TestCase):
             signal.signal(signal.SIGTERM, old)
 
 
+class NoPywin32Test(unittest.TestCase):
+    def test_backend_needs_only_ctypes(self):
+        # pywin32 was installed on every PC (and into the exe) for three calls; ctypes has them.
+        with open(platform_win.__file__, encoding="utf-8") as f:
+            self.assertNotRegex(f.read(), r"(?m)^\s*(import|from)\s+(win32\w*|pywintypes)\b")
+        with open(os.path.join(ROOT, "agent", "requirements.txt"), encoding="utf-8") as f:
+            self.assertNotIn("pywin32", f.read())
+
+
 @unittest.skipUnless(sys.platform == "win32", "needs Windows")
 class RealWin32Test(unittest.TestCase):
     """One pass over the real API (CI's windows-latest job): right types, no exceptions."""
