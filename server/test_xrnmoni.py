@@ -677,6 +677,287 @@ class ViewerTest(HubTest):
         self.assertEqual(200, self.call("GET", "/api/devices", auth=("guest", GUEST))[0])
 
 
+class DayTest(HubTest):
+    """What the dashboard draws a day from."""
+
+    def day(self, since=T0, until=T0 + 86400, extra=""):
+        return {d["device"]: d for d in self.get(f"/api/day?since={since}&until={until}{extra}")["devices"]}
+
+    def test_each_device_has_its_day(self):
+        self.post([ev("boot", T0 + 3600), ev("app", T0 + 3600, T0 + 7200, app="code"),
+                   ev("web", T0 + 3600, T0 + 3700, domain="docs.example", title="Docs")])
+        self.post([ev("app", T0 + 7200, T0 + 9000, app="game.exe")], token=self.pc_token, os_name="windows")
+        days = self.day()
+        self.assertEqual({"laptop", "pc"}, set(days))
+        laptop = days["laptop"]
+        self.assertEqual(3600, laptop["active"])
+        self.assertEqual([["code", 3600, None]], laptop["apps"])
+        self.assertEqual([["docs.example", 100, None]], laptop["sites"])
+        self.assertEqual([[T0 + 3600, "boot"]], laptop["marks"])
+        self.assertEqual([[T0 + 3600, T0 + 3700, "docs.example", None]], laptop["web"])
+        self.assertEqual("windows", days["pc"]["os"])
+        self.assertEqual(["pc"], [d["device"] for d in self.get(f"/api/day?since={T0}&until={T0 + 86400}&device=pc")["devices"]])
+
+    def test_heartbeat_chunks_are_one_stretch_on_the_timeline(self):
+        chunks = [ev("app", T0 + i * 30, T0 + (i + 1) * 30, app="code", title=f"file{i % 3}") for i in range(20)]
+        chunks += [ev("idle", T0 + 600, T0 + 900), ev("app", T0 + 902, T0 + 960, app="zen")]
+        self.post(chunks)
+        segments = self.day()["laptop"]["segments"]
+        self.assertEqual([[T0, T0 + 600, "app", "code", None], [T0 + 600, T0 + 900, "idle", "", None],
+                          [T0 + 902, T0 + 960, "app", "zen", None]], segments)
+
+    def test_page_time_while_away_isnt_on_the_page_track(self):
+        self.post([ev("app", T0, T0 + 600, app="zen"), ev("web", T0, T0 + 600, domain="news.example"),
+                   ev("locked", T0 + 300, T0 + 600)])
+        laptop = self.day()["laptop"]
+        self.assertEqual([[T0, T0 + 300, "news.example", None]], laptop["web"])
+        self.assertEqual({"app": 300, "web": 300, "locked": 300}, laptop["totals"])
+        self.assertEqual(300, laptop["active"])
+
+    def test_first_and_last_are_when_someone_was_there(self):
+        # A night asleep made the day start at midnight.
+        self.post([ev("sleep", T0 - 3600, T0 + 8 * 3600), ev("app", T0 + 8 * 3600, T0 + 9 * 3600, app="code"),
+                   ev("idle", T0 + 9 * 3600, T0 + 10 * 3600)])
+        laptop = self.day()["laptop"]
+        self.assertEqual((T0 + 8 * 3600, T0 + 9 * 3600), (laptop["first"], laptop["last"]))
+        self.assertEqual(8 * 3600, laptop["totals"]["sleep"])
+
+    def test_a_day_is_the_range_the_viewer_sends(self):
+        # The viewer's own midnights: an evening running past one is split between the two days.
+        self.post([ev("app", T0 - 1800, T0 + 1800, app="code")])
+        self.assertEqual(1800, self.day(T0 - 86400, T0)["laptop"]["active"])
+        after = self.day(T0, T0 + 86400)["laptop"]
+        self.assertEqual((1800, T0), (after["active"], after["segments"][0][0]))
+
+    def test_a_type_this_server_doesnt_know_is_shown_as_itself(self):
+        self.post([ev("screensaver", T0, T0 + 300), ev("app", T0 + 300, T0 + 400, app="code")])
+        laptop = self.day()["laptop"]
+        self.assertEqual(300, laptop["totals"]["screensaver"])
+        self.assertEqual(100, laptop["active"])
+
+    def test_the_figures_can_come_without_the_timeline(self):
+        self.post([ev("app", T0, T0 + 60, app="code")])
+        laptop = self.day(extra="&timeline=0")["laptop"]
+        self.assertNotIn("segments", laptop)
+        self.assertEqual(60, laptop["active"])
+
+    def test_the_week_is_each_day_by_device(self):
+        for d in range(3):
+            self.post([ev("app", T0 + d * 86400 + 3600, T0 + d * 86400 + 3600 + 600 * (d + 1), app="code")])
+        self.post([ev("app", T0 + 86400 + 100, T0 + 86400 + 200, app="game.exe")], token=self.pc_token)
+        bounds = ",".join(str(T0 + i * 86400) for i in range(4))
+        days = self.get(f"/api/days?bounds={bounds}")["days"]
+        self.assertEqual([600, 1200, 1800], [d["devices"]["laptop"]["active"] for d in days])
+        self.assertEqual([{}, {"active": 100}, {}], [{k: v for k, v in d["devices"].get("pc", {}).items() if k == "active"} for d in days])
+        self.assertEqual([["code", 600, None]], days[0]["devices"]["laptop"]["apps"])
+        for bad in ("", "1", "a,b", f"{T0},{T0}", f"{T0 + 10},{T0}", f"{T0},{T0 + 63 * 86400}",
+                    ",".join(str(T0 + i) for i in range(srv.MAX_DAYS + 2))):
+            self.assertEqual(400, self.call("GET", f"/api/days?bounds={bad}")[0], bad)
+
+    def test_a_row_opens_to_its_titles_or_pages(self):
+        self.post([ev("app", T0, T0 + 600, app="code", title="a.py"), ev("app", T0 + 600, T0 + 700, app="code", title="b.py"),
+                   ev("app", T0 + 700, T0 + 800, app="code", title="a.py"),
+                   ev("web", T0, T0 + 120, domain="docs.example", title="Intro", url="https://docs.example/intro"),
+                   ev("web", T0 + 120, T0 + 150, domain="docs.example", title="Intro", url="https://docs.example/intro?x=2")])
+        self.post([ev("app", T0, T0 + 50, app="code", title="c.py")], token=self.pc_token)
+        span = f"since={T0}&until={T0 + 86400}"
+        got = self.get(f"/api/detail?{span}&app=code&device=laptop")
+        self.assertEqual((800, [["a.py", "", 700], ["b.py", "", 100]]), (got["total"], got["rows"]))
+        self.assertEqual(850, self.get(f"/api/detail?{span}&app=code")["total"])
+        got = self.get(f"/api/detail?{span}&site=docs.example")
+        self.assertEqual([["Intro", "https://docs.example/intro", 150]], got["rows"])
+        self.assertEqual(400, self.call("GET", f"/api/detail?{span}")[0])
+
+    def test_now_is_what_each_device_last_said(self):
+        now = time.time()
+        self.post([ev("app", now - 120, now - 60, app="zen"), ev("web", now - 120, now - 60, domain="news.example", title="News"),
+                   ev("app", now - 60, now - 5, app="code", title="main.py")])
+        self.post([ev("app", now - 900, now - 600, app="game.exe"), ev("idle", now - 600, now - 30)], token=self.pc_token)
+        got = {d["device"]: d["now"] for d in self.get("/api/devices")["devices"]}
+        # The browser's last page stays its newest page long after another app is in front.
+        self.assertEqual(("app", "code", "main.py", None), (got["laptop"]["type"], got["laptop"]["app"], got["laptop"]["title"],
+                                                             got["laptop"].get("domain")))
+        self.assertEqual("idle", got["pc"]["type"])
+        self.post([ev("app", now - 5, now, app="zen"), ev("web", now - 5, now, domain="mail.example", title="Inbox")])
+        got = {d["device"]: d["now"] for d in self.get("/api/devices")["devices"]}
+        self.assertEqual(("zen", "mail.example", "Inbox"), (got["laptop"]["app"], got["laptop"]["domain"], got["laptop"]["page"]))
+
+    def test_a_long_poll_answers_when_an_agent_posts(self):
+        seq = self.get("/api/devices")["seq"]
+        self.assertEqual(seq, self.get(f"/api/changes?seq={seq}&wait=0.2")["seq"])
+        got = []
+        waiter = threading.Thread(target=lambda: got.append(self.get(f"/api/changes?seq={seq}&wait=20")))
+        start = time.monotonic()
+        waiter.start()
+        time.sleep(0.3)
+        self.post([])
+        waiter.join(10)
+        self.assertLess(time.monotonic() - start, 5)
+        self.assertNotEqual(seq, got[0]["seq"])
+        self.assertEqual(got[0]["seq"], self.get(f"/api/changes?seq={seq}&wait=20")["seq"])  # already moved: at once
+        self.assertEqual(400, self.call("GET", "/api/changes?seq=x")[0])
+
+    def test_a_long_poll_whose_caller_left_ends(self):
+        # A proxy closes this side when the page's request times out; the thread mustn't wait on.
+        seq = self.get("/api/devices")["seq"]
+        real, ended = self.app.changes.wait, []
+        with unittest.mock.patch.object(self.app.changes, "wait",
+                                        lambda *a: ended.append(real(*a)) or ended[-1]):
+            with socket.create_connection(("127.0.0.1", self.port), timeout=10) as s:
+                s.sendall(f"GET /api/changes?seq={seq}&wait=30 HTTP/1.1\r\nAuthorization: {basic('alex', RIGHT)}\r\n\r\n".encode())
+                time.sleep(0.3)
+            for _ in range(50):
+                if ended:
+                    break
+                time.sleep(0.1)
+        self.assertEqual([None], ended)  # well before its 30 s, and unanswered
+
+
+class CategoryTest(HubTest):
+    def put_rules(self, rules, match):
+        headers = {"If-Match": match} if match else {}
+        return self.call("PUT", "/api/categories", {"rules": rules}, headers)
+
+    def test_rules_need_the_version_they_replace(self):
+        status, body, headers = self.call("GET", "/api/categories")
+        self.assertEqual((200, {"version": 0, "rules": []}, '"0"'), (status, json.loads(body), headers["ETag"]))
+        rule = [{"kind": "app", "pattern": "code", "category": "Work"}]
+        self.assertEqual(428, self.put_rules(rule, None)[0])
+        status, _, headers = self.put_rules(rule, '"0"')
+        self.assertEqual((200, '"1"'), (status, headers["ETag"]))
+        status, _, headers = self.put_rules([], '"0"')
+        self.assertEqual((412, '"1"'), (status, headers["ETag"]))
+        self.assertEqual(200, self.put_rules(rule * 2, "*")[0])
+        self.assertEqual(304, self.call("GET", "/api/categories", headers={"If-None-Match": '"2"'})[0])
+
+    def test_bad_rules_are_refused(self):
+        for rules in ("x", [{"kind": "window", "pattern": "a", "category": "b"}], [{"kind": "app", "pattern": "", "category": "b"}],
+                      [{"kind": "app", "pattern": "a", "category": "x" * 41}], [{"kind": "app", "pattern": "a", "category": "\x00"}],
+                      [{"kind": "app", "pattern": "a", "category": "b"}] * (srv.MAX_RULES + 1)):
+            self.assertEqual(400, self.put_rules(rules, "*")[0], str(rules)[:60])
+        self.assertEqual({"version": 0, "rules": []}, self.get("/api/categories"))
+
+    def test_rules_put_apps_and_sites_into_categories(self):
+        self.put_rules([{"kind": "site", "pattern": "youtube.com", "category": "Video"},
+                        {"kind": "app", "pattern": "*.exe", "category": "Windows"},
+                        {"kind": "app", "pattern": "CODE", "category": "Work"},
+                        {"kind": "app", "pattern": "zen", "category": "Browsing"}], "*")
+        self.post([ev("app", T0, T0 + 100, app="code"), ev("app", T0 + 100, T0 + 400, app="zen"),
+                   ev("web", T0 + 100, T0 + 300, domain="m.youtube.com"), ev("web", T0 + 300, T0 + 400, domain="notyoutube.com"),
+                   ev("app", T0 + 400, T0 + 450, app="game.exe"), ev("app", T0 + 450, T0 + 460, app="other")])
+        laptop = self.get(f"/api/day?since={T0}&until={T0 + 86400}")["devices"][0]
+        # A page's category says more than the browser's.
+        self.assertEqual([["Video", 200], ["Browsing", 100], ["Work", 100], ["Windows", 50], ["", 10]], laptop["categories"])
+        self.assertEqual("Video", laptop["sites"][0][2])
+        self.assertEqual([[200, "Video"]], [[s[1] - s[0], s[3]] for s in laptop["web"] if s[2] == "m.youtube.com"])
+        got = self.get(f"/api/detail?since={T0}&until={T0 + 86400}&category=Video")
+        self.assertEqual([["m.youtube.com", "site", 200]], got["rows"])
+        got = self.get(f"/api/detail?since={T0}&until={T0 + 86400}&category=")
+        self.assertEqual([["other", "app", 10]], got["rows"])
+
+    def test_damaged_rules_are_never_answered_as_none(self):
+        # Read as "no rules", the page would offer to save its empty list over them.
+        self.put_rules([{"kind": "app", "pattern": "code", "category": "Work"}], "*")
+        path = os.path.join(self.data, "categories.json")
+        with open(path, "w") as f:
+            f.write('{"version": 1, "rules": [{"ki')
+        with unittest.mock.patch("sys.stderr", new_callable=io.StringIO) as log:
+            self.assertEqual(503, self.call("GET", "/api/categories")[0])
+            self.assertEqual(503, self.put_rules([], "*")[0])
+            self.post([ev("app", T0, T0 + 60, app="code")])
+            self.assertEqual(200, self.call("GET", f"/api/day?since={T0}&until={T0 + 86400}")[0])
+        self.assertIn("can't be read", log.getvalue())
+        with open(path) as f:
+            self.assertEqual('{"version": 1, "rules": [{"ki', f.read())
+
+
+class ExportTest(HubTest):
+    def test_the_range_comes_out_as_csv_in_the_viewers_zone(self):
+        self.post([ev("app", T0, T0 + 60, app="code", title="=HYPERLINK(\"http://evil.example\")"),
+                   ev("web", T0 + 60, T0 + 90, url="https://a.example/x", title="+1"), ev("boot", T0 - 10)])
+        self.post([ev("app", T0, T0 + 30, app="game.exe")], token=self.pc_token)
+        status, body, headers = self.call("GET", f"/api/export?since={T0 - 60}&until={T0 + 3600}&tz=Australia/Sydney")
+        self.assertEqual(200, status)
+        self.assertIn("text/csv", headers["Content-Type"])
+        self.assertIn('attachment; filename="xrnmoni-', headers["Content-Disposition"])
+        rows = list(__import__("csv").reader(io.StringIO(body.decode())))
+        self.assertEqual(["device", "type", "start", "end", "seconds", "app", "title", "domain", "url", "id"], rows[0])
+        self.assertEqual(5, len(rows))
+        code = next(r for r in rows if r[5] == "code")
+        self.assertEqual(("laptop", "app", "60.0"), (code[0], code[1], code[4]))
+        if code[2].endswith("+10:00") or code[2].endswith("+11:00"):  # Sydney's zone is known here
+            self.assertEqual("2026-05-29T06:26:40+10:00", code[2])
+        self.assertTrue(code[6].startswith("'="), code[6])  # a spreadsheet won't run it
+        self.assertEqual("'+1", next(r for r in rows if r[1] == "web")[6])
+        status, body, _ = self.call("GET", f"/api/export?since={T0 - 60}&until={T0 + 3600}&device=pc")
+        self.assertEqual(2, len(body.decode().strip().splitlines()))
+        self.assertEqual(400, self.call("GET", f"/api/export?since=0&until={401 * 86400}")[0])
+
+    def test_a_long_export_comes_in_pages(self):
+        with unittest.mock.patch.object(srv, "EXPORT_PAGE", 3):
+            self.post([ev("app", T0 + i, T0 + i + 1, app=f"a{i}") for i in range(10)])
+            _, body, _ = self.call("GET", f"/api/export?since={T0 - 1}&until={T0 + 3600}")
+        apps = [r.split(",")[5] for r in body.decode().strip().splitlines()[1:]]
+        self.assertEqual([f"a{i}" for i in range(10)], apps)
+
+
+class WebTest(HubTest):
+    def page(self, path="/"):
+        status, body, headers = self.call("GET", path, auth=None)
+        self.assertEqual(200, status, path)
+        return body.decode(), headers
+
+    def test_the_page_works_under_any_prefix(self):
+        # The page asked for /api/... from the root: behind a proxy publishing it under /xrnmoni
+        # those went to whatever else the proxy serves at the root.
+        for path in ("/", "/xrnmoni", "/xrnmoni/"):
+            html, _ = self.page(path)
+            self.assertIn('<base href="/xrnmoni/">', html)
+        self.app.prefix = "/moni"
+        self.app.pages.clear()
+        self.assertIn('<base href="/moni/">', self.page("/moni/")[0])
+        self.app.prefix = ""
+        self.app.pages.clear()
+        self.assertIn('<base href="/">', self.page("/")[0])
+
+    def test_every_path_the_page_uses_is_relative(self):
+        web = os.path.join(HERE, "web")
+        for name in os.listdir(web):
+            with open(os.path.join(web, name), encoding="utf-8") as f:
+                text = f.read().replace('<base href="/xrnmoni/">', "")
+            for absolute in ('"/api', "'/api", "`/api", 'fetch("/', 'href="/', 'src="/', "url(/"):
+                self.assertNotIn(absolute, text, name)
+        self.assertEqual(200, self.call("GET", "/xrnmoni/app.js", auth=None)[0])
+
+    def test_the_page_runs_only_its_own_files(self):
+        html, headers = self.page()
+        csp = headers["Content-Security-Policy"]
+        self.assertIn("script-src 'self';", csp)
+        self.assertIn("style-src 'self';", csp)
+        self.assertNotIn("unsafe", csp)
+        self.assertNotIn("<script>", html)
+        self.assertNotIn("style=", html)
+
+    def test_text_from_agents_never_goes_in_as_html(self):
+        # Window and page titles are chosen by whatever was open; the first dashboard's innerHTML
+        # let a page titled with markup run script in it.
+        with open(os.path.join(HERE, "web", "app.js"), encoding="utf-8") as f:
+            script = f.read()
+        for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval("):
+            self.assertNotIn(sink, script)
+
+    def test_the_page_is_revalidated_not_kept(self):
+        _, headers = self.page("/app.js")
+        self.assertEqual("no-cache", headers["Cache-Control"])
+        status, _, _ = self.call("GET", "/app.js", auth=None, headers={"If-None-Match": headers["ETag"]})
+        self.assertEqual(304, status)
+
+    def test_nothing_outside_the_page_is_served(self):
+        for path in ("/../xrnmoni.py", "/%2e%2e/xrnmoni.py", "/xrnmoni.py", "/.hidden.js", "/test/x.js",
+                     "/users", "/xrnmoni.db", "/tokens.json", "/app.js.map"):
+            self.assertEqual(404, self.call("GET", path, auth=None)[0], path)
+
+
 class ProcessTest(unittest.TestCase):
     """The program as it's run: under pythonw on Windows there is no console at all."""
 

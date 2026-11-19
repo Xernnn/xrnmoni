@@ -35,5 +35,8 @@ jobs:
       - name: Server tests
         run: python -m unittest server/test_xrnmoni.py
 
+      - name: Dashboard date tests
+        run: node --test server/test_web.mjs
+
       - name: Tests
         run: python -m unittest discover tests

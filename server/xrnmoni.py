@@ -15,37 +15,53 @@ may not strip that prefix. Standard library only, plus `bcrypt` to read the user
                                            "rejected": [{"index", "id", "error"}]}
     POST   /api/session               with Basic auth and X-Xrn-Client: sets the sign-in cookie
     DELETE /api/session               signs this browser out, and ends its cookie for good
-    GET    /api/devices               each device and when it was last heard from
+    GET    /api/devices               each device: when it was last heard from, what it's doing
+    GET    /api/day?since=&until=     per device: the timeline, active time, apps, sites, categories
+                                      (timeline=0: the figures without the timeline)
+    GET    /api/days?bounds=t0,t1,..  per day (t0-t1, t1-t2, ...) and device: active time, categories
+    GET    /api/detail?since=&until=&app=|site=|category=
+                                      the window titles or pages behind one row, with time
     GET    /api/activity?since=&until=  the events themselves, newest first
-    GET    /api/summary?device=&since=&until=  one device's totals
+    GET    /api/export?since=&until=&tz=  the same as CSV, times in zone tz
+    GET    /api/summary?device=&since=&until=  totals in the shape the first dashboard read
+    GET    /api/categories            the category rules; ETag: "<version>"
+    PUT    /api/categories            replaces them; needs If-Match: "<version>" (or "*")
+    GET    /api/changes?seq=&wait=    {"seq"}, as soon as it isn't [seq] or [wait] seconds pass
+    GET    /  (and what it asks for)  the dashboard, from web/
     HEAD                              any GET above, answered without its body
 
-Every read also takes device=NAME for one device. Times are epoch seconds. Reads need the sign-in
-cookie with an X-Xrn-Client header, or Basic auth, from a viewer: the users file's first user, and
-anyone named with --viewer. Device tokens only post events.
+Every read also takes device=NAME for one device. Times are epoch seconds; the dashboard sends the
+viewer's own midnights, so a day is the viewer's day. Reads need the sign-in cookie with an
+X-Xrn-Client header, or Basic auth, from a viewer: the users file's first user, and anyone named
+with --viewer. Device tokens only post events.
 
     python3 xrnmoni.py --data DIR [--host 127.0.0.1] [--port 5240] [--users FILE] [--prefix /xrnmoni]
     python3 xrnmoni.py user add|remove|list [NAME] --data DIR [--users FILE]
     python3 xrnmoni.py token add DEVICE|list|revoke ID --data DIR
 
-DIR holds the database, the device tokens and, by default, the users file.
+DIR holds the database, the device tokens, the category rules and, by default, the users file.
 """
 import argparse
 import base64
+import csv
+import fnmatch
 import hashlib
 import hmac
+import io
 import ipaddress
 import json
 import math
 import os
 import re
 import secrets
+import select
+import socket
 import sqlite3
 import sys
 import threading
 import time
 import zlib
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
@@ -59,6 +75,9 @@ MAX_BODY = 8 * 1024 * 1024  # an agent back after days offline sends what it kep
 MAX_EVENTS = 10000
 MAX_SPAN_S = 7 * 86400  # one event; a laptop asleep over a long weekend is still one
 MAX_RANGE_S = 62 * 86400  # what one view reads
+MAX_EXPORT_S = 400 * 86400
+MAX_DAYS = 62
+EXPORT_PAGE = 5000
 EARLIEST = 946684800.0  # 2000-01-01: a clock that far back is wrong
 AHEAD_S = 86400  # a clock that far ahead is wrong too
 FIELD_MAX = {"app": 200, "title": 1000, "url": 4000, "domain": 253, "os": 32}
@@ -71,6 +90,7 @@ MERGE_GAP_S = 5  # pieces of the same thing this close are one stretch on the ti
 TOP = 50
 RETAIN_DAYS = 400
 PRUNE_EVERY_S = 86400
+WAIT_MAX_S = 30
 PREFIX = "/xrnmoni"
 DEFAULT_PORT = 5240
 LOG_MAX = 5 * 1024 * 1024
@@ -87,6 +107,10 @@ USER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 TOKEN = re.compile(r"xrnmoni_([0-9a-f]{8})_([A-Za-z0-9_-]{43})")
 TOKEN_ID = re.compile(r"[0-9a-f]{8}")
 MAX_TOKENS = 50
+MAX_RULES = 500
+CATEGORY = re.compile(r"[^\x00-\x1f\x7f]{1,40}")
+PATTERN = re.compile(r"[^\x00-\x1f\x7f]{1,200}")
+TZ_NAME = re.compile(r"[A-Za-z0-9_+-]{1,32}(?:/[A-Za-z0-9_+-]{1,32}){0,2}")
 
 WEB_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -442,6 +466,7 @@ class Day:
     screen, isn't time spent. An event reaching past either end counts only for its part inside."""
 
     def __init__(self, rows, since, until, category, want=None):
+        self.category = category
         self.active = 0.0
         self.totals = {}
         self.apps, self.sites, self.categories = {}, {}, {}
@@ -457,8 +482,6 @@ class Day:
             s, e = max(start, since), min(end, until)
             if e <= s:
                 continue
-            self.first = s if self.first is None else min(self.first, s)
-            self.last = e if self.last is None else max(self.last, e)
             if kind == "app":
                 apps.append((s, e, (app or "?", title or "")))
             elif kind == "web":
@@ -491,6 +514,9 @@ class Day:
             if not app and not web:
                 continue
             self.active += d
+            # The first and last moments someone was at it, not the night the device slept through.
+            self.first = x if self.first is None else self.first
+            self.last = y
             # A page's category, where it has one, says more than the browser's.
             cat, source = None, None
             if web:
@@ -537,9 +563,9 @@ class Day:
         doc = {
             "active": round(self.active, 1),
             "totals": {k: round(v, 1) for k, v in sorted(self.totals.items())},
-            "apps": ranked(self.apps),
-            "sites": ranked(self.sites),
-            "categories": ranked(self.categories),
+            "apps": [[n, s, self.category("app", n)] for n, s in ranked(self.apps)],
+            "sites": [[n, s, self.category("site", n)] for n, s in ranked(self.sites)],
+            "categories": ranked(self.categories, MAX_RULES),
             "first": self.first,
             "last": self.last,
         }
@@ -551,6 +577,82 @@ class Day:
 
 
 # ---- categories ---------------------------------------------------------------------------------
+
+class Unreadable(Exception):
+    pass
+
+
+def clean_rules(rules):
+    """The rules as they'll be kept, or ValueError: [{"kind": "app"|"site", "pattern", "category"}]."""
+    if not isinstance(rules, list) or len(rules) > MAX_RULES:
+        raise ValueError(f"rules must be a list of at most {MAX_RULES}")
+    out = []
+    for r in rules:
+        if not isinstance(r, dict) or r.get("kind") not in ("app", "site"):
+            raise ValueError('each rule needs kind "app" or "site"')
+        pattern, cat = r.get("pattern"), r.get("category")
+        if not isinstance(pattern, str) or not PATTERN.fullmatch(pattern.strip()):
+            raise ValueError("each rule needs a pattern of 1 to 200 characters")
+        if not isinstance(cat, str) or not CATEGORY.fullmatch(cat.strip()):
+            raise ValueError("each rule needs a category of 1 to 40 characters")
+        out.append({"kind": r["kind"], "pattern": pattern.strip(), "category": cat.strip()})
+    return out
+
+
+class Categories:
+    """The rules that put apps and sites into categories, in categories.json: {"version", "rules"}.
+    The first that matches wins. A pattern matches a name case-insensitively and may use * and ?;
+    a site pattern also matches its subdomains (youtube.com takes m.youtube.com)."""
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.seen = self.doc = None
+
+    def read(self):
+        """{"version", "rules"}, read again when the file changes; Unreadable for a damaged file:
+        answered as empty, the dashboard would offer to save over the owner's rules with nothing."""
+        stamp = file_stamp(self.path)
+        with self.lock:
+            if stamp == self.seen and self.doc is not None:
+                return self.doc
+            if stamp is None:
+                doc = {"version": 0, "rules": []}
+            else:
+                try:
+                    with open(self.path, encoding="utf-8") as f:
+                        doc = json.load(f)
+                    if not isinstance(doc, dict) or type(doc.get("version")) is not int:
+                        raise ValueError("not a rules file")
+                    doc = {"version": doc["version"], "rules": clean_rules(doc.get("rules"))}
+                except (OSError, ValueError, RecursionError) as e:
+                    raise Unreadable(f"{self.path} can't be read: {e}") from e
+            self.seen, self.doc = stamp, doc
+            return doc
+
+    def write(self, version, rules):
+        write_private(self.path, json.dumps({"version": version, "rules": rules}, ensure_ascii=False, indent=1))
+
+    def matcher(self):
+        """category(kind, name): the category the rules give a name, or None. With rules that
+        can't be read, nothing has a category (and the log says why)."""
+        try:
+            rules = self.read()["rules"]
+        except Unreadable as e:
+            log(str(e))
+            rules = []
+        compiled = [(r["kind"], r["pattern"].lower(), r["category"]) for r in rules]
+        memo = {}
+
+        def category(kind, name):
+            key = (kind, name)
+            if key not in memo:
+                low = (name or "").lower()
+                memo[key] = next((c for k, p, c in compiled if k == kind and (
+                    fnmatch.fnmatchcase(low, p) or (kind == "site" and low.endswith("." + p)))), None)
+            return memo[key]
+        return category
+
 
 # ---- device tokens ------------------------------------------------------------------------------
 
@@ -632,6 +734,8 @@ class Tokens:
         return True
 
 
+# ---- logins -------------------------------------------------------------------------------------
+
 def load_session_key(path):
     """Made on first start by whichever server gets there first; any others sharing the users file
     read it."""
@@ -650,8 +754,6 @@ def load_session_key(path):
         time.sleep(0.1)
     raise SystemExit(f"{path} is too short to sign with")
 
-
-# ---- logins -------------------------------------------------------------------------------------
 
 def read_names(users_path):
     """The user names an htpasswd file lists, first first: the first is the owner."""
@@ -997,6 +1099,32 @@ def host_key(host):
 
 # ---- the server ---------------------------------------------------------------------------------
 
+class Changes:
+    """A number that moves whenever an agent posts, for the dashboard's long poll. It starts from
+    the clock, so a restarted server never repeats the number a page last saw."""
+
+    def __init__(self):
+        self.cond = threading.Condition()
+        self.seq = int(time.time() * 1000)
+
+    def bump(self):
+        with self.cond:
+            self.seq += 1
+            self.cond.notify_all()
+
+    def wait(self, seen, timeout, gone):
+        deadline = time.monotonic() + timeout
+        with self.cond:
+            while self.seq == seen:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                self.cond.wait(min(1.0, left))
+                if self.seq == seen and gone():
+                    return None
+            return self.seq
+
+
 class App:
     def __init__(self, data, users=None, web=None, prefix=PREFIX, retain_days=RETAIN_DAYS, viewers=(),
                  legacy_token=None):
@@ -1016,6 +1144,9 @@ class App:
         elif legacy_token and len(legacy_token) < 16:
             log("XRNMONI_TOKEN is short; device tokens (token add) are safer")
         self.tokens = Tokens(os.path.join(data, "tokens.json"), legacy_token)
+        self.categories = Categories(os.path.join(data, "categories.json"))
+        self.categories_lock = threading.Lock()
+        self.changes = Changes()
         self.pages = {}  # web file -> (stamp, ETag, bytes)
 
     def is_viewer(self, user):
@@ -1040,6 +1171,26 @@ class App:
     def device_names(self, only):
         names = [d["device"] for d in self.store.devices()]
         return [n for n in names if n == only] if only is not None else names
+
+    def now_doing(self, device):
+        """What [device] last said it was doing: its event that reached furthest, and the page that
+        was in front during it."""
+        latest = self.store.latest(device)
+        spans = [r for r in latest if r[6] > r[5]]
+        if not spans:
+            return None
+        top = max(spans, key=lambda r: (r[6], r[0] in AWAY, r[0] == "app"))
+        doc = {"type": top[0], "app": top[1], "title": top[2], "since": top[5], "until": top[6]}
+        if top[0] == "app":
+            # A page counts only if it was in front during that same stretch: the browser's last
+            # page stays the newest web event long after another app has taken the front.
+            web = max((r for r in spans if r[0] == "web"), key=lambda r: r[6], default=None)
+            if web and web[6] > top[5] + 1 and web[5] < top[6]:
+                doc.update(domain=web[4], page=web[2])
+        elif top[0] == "web":
+            doc.update(domain=top[4], page=top[2])
+        return doc
+
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "xrnmoni/1"
@@ -1077,7 +1228,11 @@ class Handler(BaseHTTPRequestHandler):
         return path
 
     def query(self):
-        return {k: v[0] for k, v in parse_qs(self.path.partition("?")[2]).items()}
+        # Blank values kept: category= is the time no rule names. A blank device is all of them.
+        q = {k: v[0] for k, v in parse_qs(self.path.partition("?")[2], keep_blank_values=True).items()}
+        if not q.get("device"):
+            q.pop("device", None)
+        return q
 
     def send(self, code, body=b"", ctype="text/plain; charset=utf-8", headers=None, cache="no-store"):
         if isinstance(body, str):
@@ -1220,14 +1375,19 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, '{"ok":true}', JSON)
         if not path.startswith("/api/"):
             return self.serve_web(path)
-        reads = {"/api/devices": self.get_devices, "/api/activity": self.get_activity,
-                 "/api/summary": self.get_summary}
+        reads = {"/api/devices": self.get_devices, "/api/day": self.get_day, "/api/days": self.get_days,
+                 "/api/detail": self.get_detail, "/api/activity": self.get_activity,
+                 "/api/export": self.get_export, "/api/summary": self.get_summary,
+                 "/api/categories": self.get_categories, "/api/changes": self.get_changes}
         if path not in reads:
             return self.send(404, "not found")
         if not self.viewer():
             return None
         try:
             return reads[path](self.query())
+        except Unreadable as e:
+            log(str(e))
+            return self.send(503, "the category rules can't be read")
         except sqlite3.Error as e:
             log(f"database: {e}")
             return self.send(503, "the database can't be read")
@@ -1283,8 +1443,37 @@ class Handler(BaseHTTPRequestHandler):
         except sqlite3.Error as e:
             log(f"database: {e}")
             return self.send(503, "the database can't be written")
+        self.app.changes.bump()
         return self.send_json({"ok": True, "inserted": inserted, "duplicates": len(rows) - inserted,
                                "rejected": rejected})
+
+    def do_PUT(self):
+        if self.route() != "/api/categories":
+            return self.send(404, "not found")
+        if not self.viewer():
+            return None
+        doc = self.body()
+        if doc is None:
+            return None
+        try:
+            rules = clean_rules(doc.get("rules") if isinstance(doc, dict) else None)
+        except ValueError as e:
+            return self.send(400, str(e))
+        want = (self.headers.get("If-Match") or "").strip()
+        if not want:
+            return self.send(428, "If-Match required")
+        app = self.app
+        with app.categories_lock:
+            try:
+                cur = app.categories.read()
+            except Unreadable as e:
+                log(str(e))
+                return self.send(503, "the category rules can't be read")
+            if want != "*" and want.removeprefix("W/").strip('"') != str(cur["version"]):
+                return self.send(412, "changed since you read it", headers={"ETag": f'"{cur["version"]}"'})
+            version = cur["version"] + 1
+            app.categories.write(version, rules)
+        return self.send_json({"version": version, "rules": rules}, {"ETag": f'"{version}"'})
 
     def do_DELETE(self):
         if self.route() != "/api/session":
@@ -1301,8 +1490,58 @@ class Handler(BaseHTTPRequestHandler):
         for d in store.devices():
             if q.get("device") is not None and d["device"] != q["device"]:
                 continue
-            out.append(d)
-        return self.send_json({"devices": out, "now": time.time()})
+            out.append({**d, "now": self.app.now_doing(d["device"])})
+        return self.send_json({"devices": out, "now": time.time(), "seq": self.app.changes.seq})
+
+    def get_day(self, q):
+        since, until = time_range(q, MAX_RANGE_S)
+        category = self.app.categories.matcher()
+        timeline = q.get("timeline") != "0"
+        out = []
+        for d in self.app.store.devices():
+            if q.get("device") is not None and d["device"] != q["device"]:
+                continue
+            day = Day(self.app.store.rows(d["device"], since, until), since, until, category)
+            out.append({"device": d["device"], "os": d["os"], **day.answer(timeline)})
+        return self.send_json({"since": since, "until": until, "devices": out})
+
+    def get_days(self, q):
+        try:
+            bounds = [float(b) for b in q.get("bounds", "").split(",")]
+        except ValueError:
+            raise BadQuery("bounds must be numbers") from None
+        if not 2 <= len(bounds) <= MAX_DAYS + 1 or any(not math.isfinite(b) for b in bounds) \
+                or any(b >= c for b, c in zip(bounds, bounds[1:])) or bounds[-1] - bounds[0] > MAX_RANGE_S:
+            raise BadQuery(f"bounds must be 2 to {MAX_DAYS + 1} rising times, at most 62 days apart")
+        category = self.app.categories.matcher()
+        days = [{"since": b, "until": c, "devices": {}} for b, c in zip(bounds, bounds[1:])]
+        for name in self.app.device_names(q.get("device")):
+            rows = self.app.store.rows(name, bounds[0], bounds[-1])
+            for day in days:
+                part = [r for r in rows if r[5] < day["until"] and r[6] >= day["since"]]
+                if part:
+                    doc = Day(part, day["since"], day["until"], category).answer(timeline=False)
+                    day["devices"][name] = {"active": doc["active"], "totals": doc["totals"],
+                                            "categories": doc["categories"], "apps": doc["apps"][:5],
+                                            "sites": doc["sites"][:5]}
+        return self.send_json({"days": days})
+
+    def get_detail(self, q):
+        since, until = time_range(q, MAX_RANGE_S)
+        want = next(((k, q[k]) for k in ("app", "site", "category") if k in q), None)
+        if want is None:
+            raise BadQuery("give app=, site= or category=")
+        category = self.app.categories.matcher()
+        details = {}
+        for name in self.app.device_names(q.get("device")):
+            day = Day(self.app.store.rows(name, since, until), since, until, category, want)
+            for key, (seconds, extra) in day.details.items():
+                row = details.setdefault(key, [0.0, extra])
+                row[0] += seconds
+        rows = sorted(details.items(), key=lambda kv: (-kv[1][0], kv[0]))[:200]
+        return self.send_json({"kind": want[0], "name": want[1],
+                               "total": round(sum(v[0] for v in details.values()), 1),
+                               "rows": [[k, v[1], round(v[0], 1)] for k, v in rows]})
 
     def get_activity(self, q):
         since, until = time_range(q, MAX_RANGE_S)
@@ -1323,11 +1562,89 @@ class Handler(BaseHTTPRequestHandler):
             raise BadQuery("give device=")
         day = Day(self.app.store.rows(name, since, until), since, until, lambda k, n: None).answer(timeline=False)
         return self.send_json({
-            "apps": [{"name": n, "seconds": s} for n, s in day["apps"]],
-            "domains": [{"name": n, "seconds": s} for n, s in day["sites"]],
+            "apps": [{"name": n, "seconds": s} for n, s, _ in day["apps"]],
+            "domains": [{"name": n, "seconds": s} for n, s, _ in day["sites"]],
             "totals": {"app_seconds": day["totals"].get("app", 0), "web_seconds": day["totals"].get("web", 0),
                        "afk_seconds": day["totals"].get("idle", 0), "first_ts": day["first"], "last_ts": day["last"]},
         })
+
+    def get_export(self, q):
+        """The events as CSV, streamed in pages. Times are written in zone tz= (the viewer's), or the
+        server's own zone where that zone isn't known here. A cell that a spreadsheet would read as a
+        formula gets a ' in front: window and page titles are chosen by whatever was open."""
+        since, until = time_range(q, MAX_EXPORT_S)
+        zone = None
+        tz = q.get("tz", "")
+        if TZ_NAME.fullmatch(tz):
+            try:
+                from zoneinfo import ZoneInfo
+                zone = ZoneInfo(tz)
+            except Exception:  # no zone database here (Windows without tzdata)
+                zone = None
+        names = self.app.device_names(q.get("device"))
+
+        def when(ts):
+            if ts is None:
+                return ""
+            moment = datetime.fromtimestamp(ts, timezone.utc)
+            return (moment.astimezone(zone) if zone else moment.astimezone()).isoformat(timespec="seconds")
+
+        stamp = datetime.fromtimestamp(since).strftime("%Y-%m-%d")
+        self.send_response(200)
+        self.send_header("Cache-Control", "no-store")
+        for k, v in BASE_HEADERS.items():
+            self.send_header(k, v)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="xrnmoni-{stamp}.csv"')
+        self.end_headers()
+        self.close_connection = True  # the end of the answer is the end of the connection
+        if self.command == "HEAD":
+            return None
+        buf = io.StringIO()
+        out = csv.writer(buf, lineterminator="\r\n")
+        out.writerow(["device", "type", "start", "end", "seconds", "app", "title", "domain", "url", "id"])
+        after, rows = (-math.inf, 0), [None] * EXPORT_PAGE
+        while names and len(rows) == EXPORT_PAGE:
+            rows = self.app.store.page(names, since, until, after, EXPORT_PAGE)
+            for rid, uid, device, kind, app, title, url, domain, start, end, duration in rows:
+                seconds = (end - start) if end is not None else (duration or 0)
+                out.writerow([cell(device), kind, when(start), when(end), round(seconds, 1), cell(app),
+                              cell(title), cell(domain), cell(url), uid or ""])
+                after = (start, rid)
+            self.wfile.write(buf.getvalue().encode("utf-8"))
+            buf.seek(0)
+            buf.truncate()
+        self.wfile.write(buf.getvalue().encode("utf-8"))
+        return None
+
+    def get_categories(self, q):
+        doc = self.app.categories.read()
+        etag = f'"{doc["version"]}"'
+        if (self.headers.get("If-None-Match") or "").strip().removeprefix("W/") == etag:
+            return self.send(304, headers={"ETag": etag})
+        return self.send_json(doc, {"ETag": etag})
+
+    def get_changes(self, q):
+        """Answers once an agent has posted since the page's [seq], or after [wait] seconds; ends
+        unanswered if the page went away meanwhile."""
+        try:
+            seen = int(q.get("seq", "0"))
+            wait = max(0.0, min(float(q.get("wait", "0")), WAIT_MAX_S))
+        except ValueError:
+            raise BadQuery("seq and wait must be numbers") from None
+        seq = self.app.changes.wait(seen, wait, self.caller_gone)
+        if seq is None:
+            self.close_connection = True
+            return None
+        return self.send_json({"seq": seq})
+
+    def caller_gone(self):
+        """Whether the caller has closed its end: nothing to read but the end of the stream."""
+        try:
+            readable, _, _ = select.select([self.connection], [], [], 0)
+            return bool(readable) and self.connection.recv(1, socket.MSG_PEEK) == b""
+        except (OSError, ValueError):
+            return True
 
     def serve_web(self, path):
         name = "index.html" if path in ("", "/") else path.lstrip("/")
@@ -1367,6 +1684,12 @@ def time_range(q, limit):
     if not (math.isfinite(since) and math.isfinite(until)) or until <= since or until - since > limit:
         raise BadQuery(f"until must come after since, at most {int(limit // 86400)} days later")
     return since, until
+
+
+def cell(value):
+    if value and value[0] in "=+-@\t\r":
+        return "'" + value
+    return value or ""
 
 
 class Server(ThreadingHTTPServer):
