@@ -68,7 +68,7 @@ class FakeCompositor:
     """Answers the handshake with RECORDED (or without the idle global), records every
     request, and can send idled/resumed to the notification the client made."""
 
-    def __init__(self, with_idle=True):
+    def __init__(self, with_idle=True, with_lock=True):
         self.dir = tempfile.mkdtemp()
         self.path = os.path.join(self.dir, "wayland-test")
         self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -76,6 +76,7 @@ class FakeCompositor:
         self.server.listen(1)
         self.requests = []
         self.with_idle = with_idle
+        self.with_lock = with_lock
         self.subscribed = threading.Event()
         self.conn = None
         threading.Thread(target=self.serve, daemon=True).start()
@@ -95,14 +96,22 @@ class FakeCompositor:
                 self.requests.append((obj, op, body))
                 if (obj, op) == (1, 0):  # sync: the client has asked for the registry
                     for m in RECORDED:
-                        if self.with_idle or b"ext_idle_notifier" not in m:
-                            self.conn.sendall(m)
-                if op == 1 and obj not in (1, 2):  # get_idle_notification
+                        if b"ext_idle_notifier" in m and not self.with_idle:
+                            continue
+                        if b"hyprland_lock_notifier" in m and not self.with_lock:
+                            continue
+                        self.conn.sendall(m)
+                if op == 1 and obj not in (1, 2) and len(body) == 12:  # get_idle_notification
                     self.notification, self.timeout_ms, self.seat = struct.unpack("<III", body)
+                if op == 1 and obj not in (1, 2) and len(body) == 4:  # get_lock_notification
+                    self.lock_notification = struct.unpack("<I", body)[0]
+                    self.subscribed.set()
+                if not self.with_lock and len(body) == 12:
                     self.subscribed.set()
 
-    def send(self, opcode):
-        self.conn.sendall(struct.pack("<II", self.notification, 8 << 16 | opcode))
+    def send(self, opcode, lock=False):
+        obj = self.lock_notification if lock else self.notification
+        self.conn.sendall(struct.pack("<II", obj, 8 << 16 | opcode))
 
     def bound(self):
         return [pl.wl_args(body, "usuu")[1] for obj, op, body in self.requests if obj == 2]
@@ -123,7 +132,7 @@ def wait_for(cond, timeout=3):
 @unittest.skipUnless(sys.platform.startswith("linux"), "Unix sockets")
 class WaylandIdleTest(unittest.TestCase):
     def test_idled_and_resumed_set_the_idle_time(self):
-        comp = FakeCompositor()
+        comp = FakeCompositor(with_lock=False)
         self.addCleanup(comp.close)
         changes = []
         client = pl.WaylandIdle(60, path=comp.path, on_change=lambda: changes.append(1))
@@ -138,6 +147,20 @@ class WaylandIdleTest(unittest.TestCase):
         comp.send(1)  # resumed
         self.assertTrue(wait_for(lambda: client.idle_seconds() == 0.0))
         self.assertEqual(len(changes), 2)
+
+    def test_hyprland_lock_notifications_set_locked(self):
+        comp = FakeCompositor()
+        self.addCleanup(comp.close)
+        client = pl.WaylandIdle(60, path=comp.path)
+        self.assertTrue(client.start())
+        self.assertTrue(comp.subscribed.wait(3))
+        self.assertEqual(comp.bound(), ["wl_seat", "ext_idle_notifier_v1",
+                                        "hyprland_lock_notifier_v1"])
+        self.assertIs(client.locked, False)
+        comp.send(0, lock=True)  # locked
+        self.assertTrue(wait_for(lambda: client.locked is True))
+        comp.send(1, lock=True)  # unlocked
+        self.assertTrue(wait_for(lambda: client.locked is False))
 
     def test_a_compositor_without_the_protocol_is_reported(self):
         comp = FakeCompositor(with_idle=False)

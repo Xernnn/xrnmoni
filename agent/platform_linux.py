@@ -8,12 +8,18 @@ Idle, first that works: the Wayland ext-idle-notify-v1 protocol (Hyprland, Sway,
 KDE...; a small client below speaks the wire protocol, no dependencies),
 `xprintidle` on X11, logind's IdleHint, else none. Which one is in use is logged.
 
+Lock: logind's LockedHint, and on Hyprland its lock-notify protocol (any
+ext-session-lock locker: hyprlock, Quickshell, swaylock). Sleep: logind's
+PrepareForSleep. logind is watched with `gdbus monitor`.
+
 Other Wayland compositors (GNOME, KDE) don't expose active-window info to
 unprivileged clients without a compositor-specific extension; there we fall
 back to "unknown" and log once. See README for notes.
 """
+import atexit
 import os
 import json
+import re
 import shutil
 import socket
 import struct
@@ -191,7 +197,10 @@ class WaylandIdle:
     for `timeout` seconds (ext_idle_notification_v1 "idled") and when they're back
     ("resumed"). It only listens: it creates no idle inhibitor, so it never keeps the
     screen on. The notification follows the compositor's idea of idle, so a playing
-    video that holds an idle inhibitor counts as being there."""
+    video that holds an idle inhibitor counts as being there.
+
+    Where the compositor has hyprland_lock_notifier_v1 it also hears "locked" and
+    "unlocked" (sent at once if the session is already locked)."""
 
     def __init__(self, timeout, path=None, on_change=None, now=time.time):
         self.timeout = timeout
@@ -199,6 +208,8 @@ class WaylandIdle:
         self.on_change = on_change
         self.now = now
         self.idled_at = None      # wall time of the last "idled", None when active
+        self.locked = None        # None: the compositor doesn't say
+        self.lock_notification = None
         self.connected = False
         self.error = None
         self._ready = threading.Event()
@@ -257,13 +268,22 @@ class WaylandIdle:
         # ext_idle_notifier_v1.get_idle_notification(id, timeout ms, seat)
         self._send(wl_message(notifier, 1, self.notification,
                               max(1, int(self.timeout * 1000)), seat))
+        if "hyprland_lock_notifier_v1" in globals_:
+            lock_notifier = self._bind(registry, globals_, "hyprland_lock_notifier_v1")
+            self.lock_notification = self._new_id()
+            # hyprland_lock_notifier_v1.get_lock_notification(id)
+            self._send(wl_message(lock_notifier, 1, self.lock_notification))
+            self.locked = False
         self._sock.settimeout(None)
         self.connected = True
 
     def _handle(self, obj, opcode):
-        if obj != self.notification:
+        if obj == self.notification:      # 0 idled, 1 resumed
+            self.idled_at = self.now() if opcode == 0 else None
+        elif obj == self.lock_notification:  # 0 locked, 1 unlocked
+            self.locked = opcode == 0
+        else:
             return
-        self.idled_at = self.now() if opcode == 0 else None
         if self.on_change:
             self.on_change()
 
@@ -284,6 +304,7 @@ class WaylandIdle:
             first = not self._ready.is_set()
             self.connected = False
             self.idled_at = None
+            self.locked, self.lock_notification = None, None
             if self._sock:
                 self._sock.close()
             self._sock, self._next_id, self._buf = None, 2, b""
@@ -333,6 +354,76 @@ def logind_idle_seconds(session, now=time.time):
     return max(0.0, now() - since / 1e6)
 
 
+def parse_logind_signal(line, session):
+    """One line of `gdbus monitor` output -> ("sleep" | "locked", bool), or None.
+
+    /org/freedesktop/login1: org.freedesktop.login1.Manager.PrepareForSleep (true,)
+    /org/freedesktop/login1/session/_2: org.freedesktop.DBus.Properties.PropertiesChanged
+        ('org.freedesktop.login1.Session', {'LockedHint': <true>}, @as [])"""
+    if ": org.freedesktop.login1.Manager.PrepareForSleep (" in line:
+        return "sleep", "(true" in line
+    if session and line.startswith(session + ": ") and ".PropertiesChanged (" in line:
+        m = re.search(r"'LockedHint': <(true|false)>", line)
+        if m:
+            return "locked", m.group(1) == "true"
+    return None
+
+
+class LogindWatcher:
+    """Follows logind's PrepareForSleep signal and the session's LockedHint by reading
+    `gdbus monitor --system` (which needs no privileges), restarting it if it exits."""
+
+    def __init__(self, session, on_change=None, now=time.time,
+                 command=("gdbus", "monitor", "--system", "--dest", "org.freedesktop.login1")):
+        self.session = session
+        self.on_change = on_change
+        self.now = now
+        self.command = list(command)
+        self.locked = False
+        self.sleep_since = None   # wall time of PrepareForSleep(true), until (false)
+        self.proc = None
+
+    def _read_locked(self):
+        try:
+            self.locked = bool(_busctl("get-property", "org.freedesktop.login1", self.session,
+                                       "org.freedesktop.login1.Session", "LockedHint")[0])
+        except (OSError, ValueError, KeyError, IndexError, subprocess.SubprocessError):
+            pass
+
+    def feed(self, line):
+        got = parse_logind_signal(line, self.session)
+        if not got:
+            return
+        kind, value = got
+        if kind == "sleep":
+            self.sleep_since = (self.sleep_since or self.now()) if value else None
+        else:
+            self.locked = value
+        if self.on_change:
+            self.on_change()
+
+    def run(self):
+        while True:
+            self._read_locked()  # it may have changed while nothing was watching
+            try:
+                self.proc = subprocess.Popen(self.command, stdout=subprocess.PIPE,
+                                             stderr=subprocess.DEVNULL, text=True)
+                for line in self.proc.stdout:
+                    self.feed(line)
+                self.proc.wait()
+            except OSError as e:
+                print(f"[linux] logind watch failed: {e}", flush=True)
+            time.sleep(10)
+
+    def start(self):
+        atexit.register(self.stop)
+        threading.Thread(target=self.run, daemon=True, name="logind").start()
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+
+
 # ---- idle source -------------------------------------------------------------
 _IDLE = {"source": None}
 _settings = {"afk_threshold": 60.0, "on_change": None}
@@ -345,6 +436,27 @@ def configure(afk_threshold=None, on_change=None):
         _settings["afk_threshold"] = float(afk_threshold)
     _settings["on_change"] = on_change
     _pick_idle_source()
+    _start_logind()
+
+
+_LOGIND = {"started": False, "watcher": None}
+
+
+def _start_logind():
+    if _LOGIND["started"]:
+        return _LOGIND["watcher"]
+    _LOGIND["started"] = True
+    session = shutil.which("gdbus") and shutil.which("busctl") and logind_session_path()
+    if session:
+        _LOGIND["watcher"] = LogindWatcher(session, on_change=_settings["on_change"])
+        _LOGIND["watcher"].start()
+    client = _IDLE.get("client")
+    sources = [name for name, ok in (("logind LockedHint", session),
+                                     ("Hyprland lock-notify", client and client.locked is not None))
+               if ok]
+    print(f"[linux] lock: {' + '.join(sources) or 'none'}; sleep: "
+          f"{'logind PrepareForSleep' if session else 'gaps in wall time only'}", flush=True)
+    return _LOGIND["watcher"]
 
 
 def _pick_idle_source():
@@ -381,6 +493,22 @@ def get_active_window():
     if mode == "hyprland":
         return _hypr_active_window()
     return None, None
+
+
+def is_locked():
+    """True while the session is locked; None when nothing here can tell."""
+    watcher = _start_logind()
+    client = _IDLE.get("client")
+    states = [watcher.locked] if watcher else []
+    if client and client.locked is not None:
+        states.append(client.locked)
+    return any(states) if states else None
+
+
+def sleep_started():
+    """Wall time logind announced the machine is going to sleep, until it's back."""
+    watcher = _start_logind()
+    return watcher.sleep_since if watcher else None
 
 
 def get_idle_seconds():

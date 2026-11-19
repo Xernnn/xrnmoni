@@ -384,7 +384,8 @@ def elapsed_clock():
 
 
 class Tracker:
-    """Samples the foreground window and idle time and turns them into intervals.
+    """Samples the foreground window, idle time, lock and sleep and turns them into
+    intervals: app, idle, locked, sleep.
 
     The open interval is sent in closed chunks of CHUNK seconds as it goes, so an
     hour in one window shows up minute by minute, and a crash loses at most the
@@ -431,43 +432,56 @@ class Tracker:
             return
         last_wall, last_elapsed = self.last
         limit = self.cfg.poll_interval + 10
+        if self.cur and self.cur["type"] == "sleep":
+            return  # logind said we were going to sleep; that interval covers the gap
         if now - last_wall > limit and elapsed - last_elapsed > limit:
             self._close(last_wall)
             self._emit({"type": "sleep", "start": last_wall}, now)
         elif now - last_wall > limit or now < last_wall:
             self._close(last_wall)
 
+    def _probe(self, name):
+        """An optional backend call (is_locked, sleep_started); None if absent or failing."""
+        fn = getattr(self.backend, name, None)
+        try:
+            return fn() if fn else None
+        except Exception:
+            return None
+
+    def _want(self, now):
+        """What the machine is doing now: (type, since, app, title), or None for no
+        window. Sleep beats locked beats idle beats the foreground window."""
+        sleeping = self._probe("sleep_started")
+        if sleeping:
+            return "sleep", min(sleeping, now), None, None
+        if self._probe("is_locked"):
+            return "locked", now, None, None
+        try:
+            idle = self.backend.get_idle_seconds()
+        except Exception:
+            idle = 0.0
+        if idle >= self.cfg.afk_threshold:
+            return "idle", now - idle, None, None  # since input stopped
+        try:
+            app, title = self.backend.get_active_window()
+        except Exception as e:
+            app, title = None, None
+            log(f"[tracker] active-window error: {e}")
+        return ("app", now, app, title) if app is not None else None
+
     def tick(self):
         now = self.now()
         elapsed = self.clock()
         self._check_gap(now, elapsed)
         self.last = (now, elapsed)
-        cur = self.cur
-        try:
-            idle = self.backend.get_idle_seconds()
-        except Exception:
-            idle = 0.0
-
-        if idle >= self.cfg.afk_threshold:
-            # away: the app interval ended when input stopped
-            if not cur or cur["type"] != "idle":
-                since = now - idle
-                self._close(max(since, cur["start"]) if cur else since)
-                self._open("idle", since)
-        else:
-            if cur and cur["type"] == "idle":
-                self._close(now)
-                cur = None
-            try:
-                app, title = self.backend.get_active_window()
-            except Exception as e:
-                app, title = None, None
-                log(f"[tracker] active-window error: {e}")
-            if app is None:
-                self._close(now)
-            elif cur is None or cur["app"] != app or cur["title"] != title:
-                self._close(now)
-                self._open("app", now, app, title)
+        cur, want = self.cur, self._want(now)
+        if want is None:
+            self._close(now)
+        elif not cur or (cur["type"], cur["app"], cur["title"]) != (want[0], want[2], want[3]):
+            # idle and sleep start in the past (when input stopped / sleep was announced):
+            # what was open ends there, or where its unsent part begins if that is later
+            self._close(max(want[1], cur["start"]) if cur else want[1])
+            self._open(*want)
 
         cur = self.cur
         if cur and now - cur["start"] >= CHUNK:
