@@ -145,8 +145,8 @@ if (-not $fromInstalled) {
     }
     Write-Host "Copied to $XrnApp"
 }
-# The extension gets a folder of its own that stays put across updates: Chrome and Edge name
-# an unpacked extension after the folder it was loaded from.
+# The extension gets a folder of its own that stays put across updates, so the browser
+# keeps loading it from the same place.
 $extSource = Join-Path $src 'extension'
 if ((Test-Path (Join-Path $extSource 'manifest.json')) -and
     (Resolve-Path $extSource).Path.TrimEnd('\') -ine $XrnExtension.TrimEnd('\')) {
@@ -248,18 +248,18 @@ elseif ($WithHub -and ($ask -or -not $token)) {
 if (-not $token) { Fail 'A device token is needed: make one on the hub with  xrnmoni.py token add <name>.' }
 
 # The browser extension posts to the agent on 127.0.0.1 with this secret, and only from the
-# origins listed. Chrome and Edge name an unpacked extension after its folder, so the copy in
-# %LOCALAPPDATA%\xrnmoni\extension has a known origin; Firefox's is random per profile and
-# is added with -BridgeOrigin (the extension's options page shows it).
+# origins listed. Chrome, Edge and Brave name it after the public key in its manifest, so its
+# origin is known; Firefox's is random per profile and is added with -BridgeOrigin (the
+# extension's options page shows it).
 $secret = Read-XrnConfigValue 'bridge_secret'
 if (-not $secret) { $secret = New-XrnSecret }
 $origins = New-Object System.Collections.Generic.List[string]
 foreach ($o in @(Read-XrnConfigArray 'bridge_origins') + @($BridgeOrigin)) {
     if ($o -and -not $origins.Contains($o.Trim())) { $origins.Add($o.Trim()) }
 }
-if (Test-Path -LiteralPath $XrnExtension) {
-    $chromium = 'chrome-extension://' + (Get-UnpackedExtensionId $XrnExtension)
-    if (-not $origins.Contains($chromium)) { $origins.Add($chromium) }
+if (Test-Path -LiteralPath (Join-Path $XrnExtension 'manifest.json')) {
+    $chromium = 'chrome-extension://' + (Get-XrnExtensionId $XrnExtension)
+    if ($chromium -ne 'chrome-extension://' -and -not $origins.Contains($chromium)) { $origins.Add($chromium) }
 }
 $values = [ordered]@{
     server_url = ConvertTo-TomlString $url

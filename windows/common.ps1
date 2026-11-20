@@ -168,13 +168,13 @@ function New-XrnSecret {
     [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
 }
 
-function Get-UnpackedExtensionId([string]$Path) {
-    # Chrome, Edge and Brave name an extension loaded unpacked after its folder: SHA-256 of the
-    # full path in UTF-16 with the drive letter upper-cased, the first 32 hex digits written
-    # with the letters a-p for 0-f.
-    $p = [IO.Path]::GetFullPath($Path).TrimEnd('\')
-    if ($p.Length -ge 2 -and $p[1] -eq ':') { $p = $p.Substring(0, 1).ToUpperInvariant() + $p.Substring(1) }
+function Get-XrnExtensionId([string]$Folder) {
+    # Chrome, Edge and Brave name an extension whose manifest has a "key" after that key,
+    # wherever its folder is: SHA-256 of the key (a public key, base64 in the manifest), the
+    # first 32 hex digits written with the letters a-p for 0-f. $null if there is no key.
+    $manifest = [IO.File]::ReadAllText((Join-Path $Folder 'manifest.json')) | ConvertFrom-Json
+    if (-not $manifest.key) { return $null }
     $sha = [Security.Cryptography.SHA256]::Create()
-    $hash = $sha.ComputeHash([Text.Encoding]::Unicode.GetBytes($p))
+    $hash = $sha.ComputeHash([Convert]::FromBase64String($manifest.key))
     -join ($hash[0..15] | ForEach-Object { [string][char](97 + ($_ -shr 4)) + [char](97 + ($_ -band 15)) })
 }

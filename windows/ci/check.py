@@ -4,14 +4,18 @@
         waits until the hub took (200, none rejected) a batch from NAME holding an event of
         that type, through the prefix; --after N ignores the log's first N lines.
     python check.py lines LOG                         prints how many lines LOG has
-    python check.py bridge CONFIG                     posts a page as the extension would, to
-        the agent's bridge_port with its bridge_secret, from chrome-extension://abcd...
+    python check.py bridge CONFIG [--origin ORIGIN ...]
+        posts a page as the extension would, to the agent's bridge_port with its
+        bridge_secret, from the origin Chrome gives the extension (from the key in
+        extension/manifest.json, not from the config) and from each ORIGIN
     python check.py processes PID [PID ...] [--uac-off]
         not elevated (unless UAC is off, when nothing can be), no console, GUI exe
     python check.py exe PATH                          windowed exe with its CA bundle
     python check.py toml FILE EXPECTED_JSON           FILE has the keys and values in EXPECTED_JSON
 """
 import argparse
+import base64
+import hashlib
 import json
 import os
 import sys
@@ -56,7 +60,16 @@ def lines(a):
     return 0
 
 
-ORIGIN = "chrome-extension://abcdefghijklmnopabcdefghijklmnop"
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def chromium_origin():
+    """The origin Chrome, Edge and Brave give the extension wherever its folder is: SHA-256 of
+    the manifest's public key, the first 32 hex digits written as a-p."""
+    with open(os.path.join(ROOT, "extension", "manifest.json"), encoding="utf-8") as f:
+        key = json.load(f)["key"]
+    digest = hashlib.sha256(base64.b64decode(key)).hexdigest()[:32]
+    return "chrome-extension://" + "".join(chr(ord("a") + int(c, 16)) for c in digest)
 
 
 def bridge(a):
@@ -65,22 +78,25 @@ def bridge(a):
     with open(a.config, "rb") as f:
         cfg = tomllib.load(f)
     port = cfg.get("bridge_port", 8129)
-    now = time.time()
-    body = json.dumps({"id": os.urandom(16).hex(), "url": "https://example.com/ci?q=1",
-                       "title": "CI page", "domain": "example.com", "ts_start": now - 5,
-                       "ts_end": now, "duration": 5.0}).encode()
-    req = urllib.request.Request(f"http://127.0.0.1:{port}/browser", data=body, method="POST")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("Origin", ORIGIN)
-    req.add_header("X-Xrnmoni-Secret", cfg.get("bridge_secret", ""))
     print(f"bridge_origins: {cfg.get('bridge_origins')}")
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            print(f"bridge on 127.0.0.1:{port} answered {r.status}")
-            return 0 if r.status == 200 else 1
-    except OSError as e:
-        print(f"bridge on 127.0.0.1:{port}: {e}")
-        return 1
+    bad = 0
+    for origin in [chromium_origin(), *a.origin]:
+        now = time.time()
+        body = json.dumps({"id": os.urandom(16).hex(), "url": "https://example.com/ci?q=1",
+                           "title": "CI page", "domain": "example.com", "ts_start": now - 5,
+                           "ts_end": now, "duration": 5.0}).encode()
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/browser", data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Origin", origin)
+        req.add_header("X-Xrnmoni-Secret", cfg.get("bridge_secret", ""))
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                print(f"bridge on 127.0.0.1:{port} answered {r.status} to {origin}")
+                bad += r.status != 200
+        except OSError as e:
+            print(f"bridge on 127.0.0.1:{port} to {origin}: {e}")
+            bad += 1
+    return 1 if bad else 0
 
 
 def processes(a):
@@ -144,6 +160,7 @@ def main():
     p.add_argument("log")
     p = sub.add_parser("bridge")
     p.add_argument("config")
+    p.add_argument("--origin", action="append", default=[])
     p = sub.add_parser("processes")
     p.add_argument("pids", type=int, nargs="+")
     p.add_argument("--uac-off", action="store_true")

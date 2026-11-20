@@ -7,7 +7,11 @@ script is also parsed.
 
     python -m unittest tests.test_windows_scripts
 """
+import base64
 import glob
+import hashlib
+import importlib.util
+import json
 import os
 import re
 import shutil
@@ -33,6 +37,14 @@ def code_lines(path):
             s = line.strip()
             if s and not s.startswith(("#", "REM ", "rem ", "::")):
                 yield n, line
+
+
+def chromium_id():
+    """Chrome's id for an extension with a "key": SHA-256 of the key, first 32 hex digits as a-p."""
+    with open(os.path.join(ROOT, "extension", "manifest.json"), encoding="utf-8") as f:
+        key = json.load(f)["key"]
+    digest = hashlib.sha256(base64.b64decode(key)).hexdigest()[:32]
+    return "".join(chr(ord("a") + int(c, 16)) for c in digest)
 
 
 def read(name):
@@ -130,7 +142,34 @@ class BrowserBridgeTest(unittest.TestCase):
         self.assertIn("$XrnExtension = Join-Path $XrnHome 'extension'", read("common.ps1"))
         text = read("install.ps1")
         self.assertIn("Copy-Item -Recurse -Path $extSource -Destination $XrnExtension", text)
-        self.assertIn("'chrome-extension://' + (Get-UnpackedExtensionId $XrnExtension)", text)
+
+    def test_installer_lists_the_id_the_manifest_key_gives(self):
+        # The manifest has a "key", so Chrome, Edge and Brave name the extension after that
+        # key wherever its folder is. The installer listed a hash of the folder's path
+        # instead, an origin the browser never uses, and every post was refused with 403.
+        common = read("common.ps1")
+        body = common[common.index("function Get-XrnExtensionId"):]
+        body = body[:body.index("\n}") + 2]
+        self.assertIn("ConvertFrom-Json", body)
+        self.assertIn("[Convert]::FromBase64String($manifest.key)", body)
+        self.assertIn("SHA256", body)
+        self.assertNotIn("GetFullPath", body)           # not the folder's path
+        text = read("install.ps1")
+        self.assertIn("$chromium = 'chrome-extension://' + (Get-XrnExtensionId $XrnExtension)", text)
+        self.assertNotIn("Get-UnpackedExtensionId", common + text)
+        self.assertIn(f"`chrome-extension://{chromium_id()}`", read("README-WINDOWS.md"))
+
+    def test_ci_posts_from_the_origin_chrome_really_uses(self):
+        # The windows job used to pass the origin it then posted from (-BridgeOrigin), so it
+        # passed whatever the installer listed for the extension itself.
+        spec = importlib.util.spec_from_file_location("ci_check", os.path.join(WINDOWS, "ci", "check.py"))
+        check = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(check)
+        self.assertEqual(check.chromium_origin(), "chrome-extension://" + chromium_id())
+        with open(os.path.join(ROOT, ".github", "workflows", "ci.yml"), encoding="utf-8") as f:
+            ci = f.read()
+        self.assertNotRegex(ci, r"-BridgeOrigin\s+['\"]?chrome-extension://")
+        self.assertIn("check.py bridge", ci)
 
 
 class LogonTaskTest(unittest.TestCase):

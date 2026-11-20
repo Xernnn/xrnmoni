@@ -84,9 +84,10 @@ extension origins listed there (`bridge_origins`).
 
 1. Open `chrome://extensions` (Edge: `edge://extensions`) and turn on **Developer mode**.
 2. **Load unpacked**, and pick `%LOCALAPPDATA%\xrnmoni\extension` (paste that into the
-   folder box's address bar). Always this folder: Chrome and Edge name an unpacked
-   extension after the folder it came from, and the installer has already listed this
-   one's origin.
+   folder box's address bar). The installer keeps this folder up to date. The extension's
+   id is the same in every Chromium browser and on every PC (its manifest has a public
+   key), `jiogollbnlahboaadnimlllpohpmgnaa`, and the installer has already listed its
+   origin.
 3. **Details**: turn on **Allow in Incognito** (Edge: **Allow in InPrivate**), then open
    **Extension options**.
 4. Paste the secret the installer printed into **Secret** (it is also `bridge_secret` in
@@ -94,9 +95,9 @@ extension origins listed there (`bridge_origins`).
    `bridge_port`, and **Save**.
 5. Browse for a minute. **Last post** on the options page should say `200`.
 
-If **Origin** on the options page isn't the one in `bridge_origins` (it was loaded from
-another folder), add it: `windows\install.bat -BridgeOrigin chrome-extension://...`.
-Chrome may ask at startup about developer-mode extensions; keep it.
+**Origin** on the options page is `chrome-extension://jiogollbnlahboaadnimlllpohpmgnaa`;
+it is in `bridge_origins` already. Chrome may ask at startup about developer-mode
+extensions; keep it.
 
 **Firefox**
 
