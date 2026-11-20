@@ -342,6 +342,9 @@ class BrowserBridge(ThreadingHTTPServer):
 EXTENSION_ORIGIN = re.compile(r"^(chrome-extension|moz-extension)://[A-Za-z0-9._-]+$")
 SECRET_HEADER = "X-Xrnmoni-Secret"
 MAX_BODY = 256 * 1024
+# A refused post's body is read and dropped up to this much before answering: a socket closed
+# with unread data is reset on Windows, and the sender may lose the answer.
+DRAIN_LIMIT = 4 * 1024 * 1024
 MAX_ITEMS = 100
 MAX_SPAN = 86400.0
 EARLIEST = 946684800.0  # 2000-01-01
@@ -423,6 +426,19 @@ class _BridgeHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type, " + SECRET_HEADER)
         self.send_header("Vary", "Origin")
 
+    def _drain(self, length):
+        if not 0 < length <= DRAIN_LIMIT:
+            return
+        try:
+            self.connection.settimeout(2)
+            while length > 0:
+                chunk = self.rfile.read(min(length, 65536))
+                if not chunk:
+                    break
+                length -= len(chunk)
+        except OSError:
+            pass
+
     def _refuse(self, code, cors=False, msg=None):
         self.send_response(code)
         if cors:
@@ -449,8 +465,10 @@ class _BridgeHandler(BaseHTTPRequestHandler):
         except ValueError:
             return self._refuse(400)
         if length > MAX_BODY:
+            self._drain(length)
             return self._refuse(413)
         if not self._origin_ok() or not self._secret_ok():
+            self._drain(length)
             return self._refuse(403)
         try:
             data = json.loads(self.rfile.read(length) or b"null",

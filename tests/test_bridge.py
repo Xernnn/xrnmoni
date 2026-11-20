@@ -195,3 +195,54 @@ class GatingTest(BridgeCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RefusedBodyTest(unittest.TestCase):
+    """A refused post's body is read before the answer goes out. Closing a socket with unread
+    data makes Windows reset the connection, and the sender can lose the answer: CI on
+    windows-latest saw ConnectionAbortedError instead of the 413 for an oversized body."""
+
+    def handle(self, raw):
+        class Kept(io.BytesIO):
+            def close(self):  # the handler closes its files; keep them readable for the checks
+                pass
+
+        class Conn:
+            def __init__(self):
+                self.inp, self.out = Kept(raw), Kept()
+
+            def makefile(self, mode, *a, **k):
+                return self.inp if "r" in mode else self.out
+
+            def sendall(self, data):
+                self.out.write(data)
+
+            def settimeout(self, t):
+                pass
+
+        class Server:
+            origins = {ORIGIN}
+            secret = SECRET
+
+            def log_once(self, *a):
+                pass
+
+        conn = Conn()
+        agent._BridgeHandler(conn, ("127.0.0.1", 1), Server())
+        return conn
+
+    def request(self, origin, body):
+        return (f"POST /browser HTTP/1.0\r\nOrigin: {origin}\r\nX-Xrnmoni-Secret: {SECRET}\r\n"
+                f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n").encode() + body
+
+    def test_an_oversized_body_is_read_before_the_413(self):
+        raw = self.request(ORIGIN, b'{"title":"' + b"x" * (agent.MAX_BODY + 1024) + b'"}')
+        conn = self.handle(raw)
+        self.assertTrue(conn.out.getvalue().startswith(b"HTTP/1.0 413"))
+        self.assertEqual(conn.inp.tell(), len(raw))
+
+    def test_a_refused_origins_body_is_read_before_the_403(self):
+        raw = self.request("https://evil.example", b'{"url":"https://example.com"}')
+        conn = self.handle(raw)
+        self.assertTrue(conn.out.getvalue().startswith(b"HTTP/1.0 403"))
+        self.assertEqual(conn.inp.tell(), len(raw))
