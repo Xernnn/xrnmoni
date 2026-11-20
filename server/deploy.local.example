@@ -1,0 +1,23 @@
+# Settings for server/deploy.sh. Copy to server/deploy.local (kept out of git) and fill in.
+
+# The ssh host the hub goes to.
+XRNMONI_HOST=myserver
+
+# Where on it, under its home (or a path starting with /), and the port on 127.0.0.1.
+XRNMONI_DIR=xrnmoni
+XRNMONI_PORT=5240
+
+# The path a reverse proxy publishes it under.
+XRNMONI_PREFIX=/xrnmoni
+
+# Sign in with a users file other services already share (htpasswd, bcrypt), instead of
+# xrnmoni/data/users; the first user in it sees the dashboard, plus any named here.
+#XRNMONI_USERS=~/.config/myservices/users
+#XRNMONI_VIEWERS="partner"
+
+# runit's service folder, if not Termux's $PREFIX/var/service.
+#XRNMONI_SVDIR=/etc/service
+
+# A check the run file makes before starting, and a command that publishes the hub afterwards.
+#XRNMONI_GUARD='$HOME/bin/port-free 5240'
+#XRNMONI_PUBLISH='tailscale funnel --bg --set-path /xrnmoni http://127.0.0.1:5240'

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Its log/run: svlogd keeps the hub's log, stamped, in this folder (current, plus rotated files).
+mkdir -p /var/log/sv/xrnmoni
+exec svlogd -tt /var/log/sv/xrnmoni
