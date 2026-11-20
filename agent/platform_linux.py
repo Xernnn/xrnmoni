@@ -528,13 +528,32 @@ class LogindWatcher:
         self.locked = False
         self.sleep_since = None   # wall time of PrepareForSleep(true), until (false)
         self.proc = None
+        self.retry_s = 10.0       # before starting gdbus again
+        self.stopping = False
 
-    def _read_locked(self):
+    def _read_state(self):
+        """What may have changed while nothing was watching: the lock, and whether the
+        machine is still going to sleep. A PrepareForSleep(false) sent while gdbus was
+        restarting left the agent recording sleep until the agent itself restarted."""
+        errors = (OSError, ValueError, KeyError, IndexError, subprocess.SubprocessError)
+        changed = False
         try:
-            self.locked = bool(_busctl("get-property", "org.freedesktop.login1", self.session,
-                                       "org.freedesktop.login1.Session", "LockedHint")[0])
-        except (OSError, ValueError, KeyError, IndexError, subprocess.SubprocessError):
+            locked = bool(_busctl("get-property", "org.freedesktop.login1", self.session,
+                                  "org.freedesktop.login1.Session", "LockedHint")[0])
+            changed, self.locked = locked != self.locked, locked
+        except errors:
             pass
+        try:
+            preparing = bool(_busctl("get-property", "org.freedesktop.login1",
+                                     "/org/freedesktop/login1", "org.freedesktop.login1.Manager",
+                                     "PreparingForSleep")[0])
+            if preparing != (self.sleep_since is not None):
+                self.sleep_since = self.now() if preparing else None
+                changed = True
+        except errors:
+            pass
+        if changed and self.on_change:
+            self.on_change()
 
     def feed(self, line):
         got = parse_logind_signal(line, self.session)
@@ -549,8 +568,8 @@ class LogindWatcher:
             self.on_change()
 
     def run(self):
-        while True:
-            self._read_locked()  # it may have changed while nothing was watching
+        while not self.stopping:
+            self._read_state()
             try:
                 self.proc = subprocess.Popen(self.command, stdout=subprocess.PIPE,
                                              stderr=subprocess.DEVNULL, text=True)
@@ -559,13 +578,14 @@ class LogindWatcher:
                 self.proc.wait()
             except OSError as e:
                 print(f"[linux] logind watch failed: {e}", flush=True)
-            time.sleep(10)
+            time.sleep(self.retry_s)
 
     def start(self):
         atexit.register(self.stop)
         threading.Thread(target=self.run, daemon=True, name="logind").start()
 
     def stop(self):
+        self.stopping = True
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
 

@@ -1,5 +1,7 @@
 """Locked screens and sleep become their own intervals instead of app or idle time."""
+import os
 import sys
+import tempfile
 import textwrap
 import time
 import unittest
@@ -56,6 +58,33 @@ class LogindWatcherTest(unittest.TestCase):
         self.assertTrue(w.locked)
         self.assertIsNotNone(w.sleep_since)
         w.feed(SLEEP % "false")
+        self.assertIsNone(w.sleep_since)
+
+    def test_a_wake_up_missed_while_gdbus_restarts_ends_the_sleep(self):
+        # gdbus monitor went away during the sleep (dbus restarted, it was killed), so the
+        # PrepareForSleep(false) after the wake-up came while nothing was listening. Only
+        # LockedHint was read again on the restart: the agent recorded sleep until it restarted.
+        pl._busctl = lambda *a: [{"LockedHint": False, "PreparingForSleep": False}[a[-1]]]
+        marker = os.path.join(tempfile.mkdtemp(), "ran")
+        script = textwrap.dedent(f"""
+            import os, sys, time
+            if not os.path.exists({marker!r}):
+                open({marker!r}, "w").close()
+                print({SLEEP % "true"!r}, flush=True)
+                sys.exit(0)
+            time.sleep(30)
+        """)
+        seen = []
+        w = pl.LogindWatcher(SESSION, on_change=lambda: seen.append(w.sleep_since),
+                             command=[sys.executable, "-c", script])
+        w.retry_s = 0.05
+        w.start()
+        self.addCleanup(w.stop)
+        end = time.time() + 5
+        while time.time() < end and len(seen) < 2:
+            time.sleep(0.02)
+        self.assertIsNotNone(seen[0])        # it went to sleep
+        self.assertEqual(2, len(seen))       # and the restart saw it was back
         self.assertIsNone(w.sleep_since)
 
     def test_is_locked_combines_logind_and_hyprland(self):
