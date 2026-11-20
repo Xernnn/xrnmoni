@@ -1,6 +1,6 @@
 // Days are the viewer's own: each starts at local midnight, and that moment is what the server is
 // sent. The first dashboard took today's date from toISOString(), which is the UTC date, so before
-// the UTC midnight (until 11 am in Sydney) it opened on yesterday.
+// the UTC midnight (until 1 pm in Auckland in summer) it opened on yesterday.
 
 export const pad = (n) => String(n).padStart(2, "0");
 

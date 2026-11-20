@@ -32,15 +32,15 @@ function check(t, tz, code) {
   return got.out;
 }
 
-test("just after midnight in Sydney, today is the local date, not the UTC one", (t) => {
-  // 00:27 on 20 November in Sydney is 13:27 on the 19th in UTC.
-  const out = check(t, "Australia/Sydney", `
-    const now = new Date(Date.UTC(2026, 10, 19, 13, 27));
+test("just after midnight in Auckland, today is the local date, not the UTC one", (t) => {
+  // 00:27 on 20 November in Auckland (summer time, UTC+13) is 11:27 on the 19th in UTC.
+  const out = check(t, "Pacific/Auckland", `
+    const now = new Date(Date.UTC(2026, 10, 19, 11, 27));
     return { today: d.today(now), utc: now.toISOString().slice(0, 10), bounds: d.dayBounds(d.today(now)) };`);
   if (!out) return;
   assert.equal(out.today, "2026-11-20");
   assert.equal(out.utc, "2026-11-19"); // what the first dashboard showed
-  assert.deepEqual(out.bounds, [Date.UTC(2026, 10, 19, 13) / 1000, Date.UTC(2026, 10, 20, 13) / 1000]);
+  assert.deepEqual(out.bounds, [Date.UTC(2026, 10, 19, 11) / 1000, Date.UTC(2026, 10, 20, 11) / 1000]);
 });
 
 test("late in the evening west of UTC, today is still the local date", (t) => {
@@ -51,13 +51,13 @@ test("late in the evening west of UTC, today is still the local date", (t) => {
 });
 
 test("a day with a daylight-saving change is that many hours long", (t) => {
-  const out = check(t, "Australia/Sydney", `
-    return [d.dayBounds("2026-10-04"), d.dayBounds("2026-04-05"), d.shiftKey("2026-10-03", 1)];`);
+  const out = check(t, "Pacific/Auckland", `
+    return [d.dayBounds("2026-09-27"), d.dayBounds("2026-04-05"), d.shiftKey("2026-09-26", 1)];`);
   if (!out) return;
   const [spring, autumn, next] = out;
   assert.equal(spring[1] - spring[0], 23 * 3600);
   assert.equal(autumn[1] - autumn[0], 25 * 3600);
-  assert.equal(next, "2026-10-04");
+  assert.equal(next, "2026-09-27");
 });
 
 test("a week runs Monday to Sunday around the day picked", (t) => {

@@ -895,7 +895,7 @@ class ExportTest(HubTest):
         self.post([ev("app", T0, T0 + 60, app="code", title="=HYPERLINK(\"http://evil.example\")"),
                    ev("web", T0 + 60, T0 + 90, url="https://a.example/x", title="+1"), ev("boot", T0 - 10)])
         self.post([ev("app", T0, T0 + 30, app="game.exe")], token=self.pc_token)
-        status, body, headers = self.call("GET", f"/api/export?since={T0 - 60}&until={T0 + 3600}&tz=Australia/Sydney")
+        status, body, headers = self.call("GET", f"/api/export?since={T0 - 60}&until={T0 + 3600}&tz=Pacific/Auckland")
         self.assertEqual(200, status)
         self.assertIn("text/csv", headers["Content-Type"])
         self.assertIn('attachment; filename="xrnmoni-', headers["Content-Disposition"])
@@ -904,8 +904,8 @@ class ExportTest(HubTest):
         self.assertEqual(5, len(rows))
         code = next(r for r in rows if r[5] == "code")
         self.assertEqual(("laptop", "app", "60.0"), (code[0], code[1], code[4]))
-        if code[2].endswith("+10:00") or code[2].endswith("+11:00"):  # Sydney's zone is known here
-            self.assertEqual("2026-05-29T06:26:40+10:00", code[2])
+        if code[2].endswith("+12:00") or code[2].endswith("+13:00"):  # Auckland's zone is known here
+            self.assertEqual("2026-05-29T08:26:40+12:00", code[2])
         self.assertTrue(code[6].startswith("'="), code[6])  # a spreadsheet won't run it
         self.assertEqual("'+1", next(r for r in rows if r[1] == "web")[6])
         status, body, _ = self.call("GET", f"/api/export?since={T0 - 60}&until={T0 + 3600}&device=pc")
