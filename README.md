@@ -151,10 +151,12 @@ never holds the server URL or token.
 2. *Load unpacked* → select the `extension/` folder.
 3. Open the extension's options: set *Secret* to `bridge_secret` from the agent's
    config (and *Port* if you changed `bridge_port`), then *Save*.
-4. Add the *Origin* the options page shows (`chrome-extension://…`) to
-   `bridge_origins` in the agent's config and restart the agent. Until then the agent
-   logs `[bridge] refused chrome-extension://…` once, with the origin to add.
-   *Last post* on the options page shows what the agent answered (200 = recorded).
+4. The manifest's public `key` gives the extension the same id everywhere,
+   `jiogollbnlahboaadnimlllpohpmgnaa`, and the example config already lists
+   `chrome-extension://jiogollbnlahboaadnimlllpohpmgnaa` in `bridge_origins`. An origin
+   that isn't listed is refused, and the agent logs `[bridge] refused …` once with the
+   origin to add. *Last post* on the options page shows what the agent answered
+   (200 = recorded).
 
 **Zen / Firefox** — the same folder works: the manifest names both a service
 worker (Chromium) and an event-page script (Firefox), and has a fixed add-on id.
@@ -166,8 +168,9 @@ worker (Chromium) and an event-page script (Firefox), and has a fixed add-on id.
   so set `xpinstall.signatures.required` to `false` in `about:config` (Zen, Firefox
   Developer Edition, Nightly and ESR honour it), then drag the `.xpi` onto the
   browser. A newer version is installed the same way.
-- Then set the secret and add the origin as for Chromium. Firefox's origin is
-  `moz-extension://<uuid>`, different in every profile; the options page shows it.
+- Then set the secret as for Chromium, and add the origin to `bridge_origins`:
+  Firefox's is `moz-extension://<uuid>`, different in every profile (the options
+  page shows it). The add-on id is `xrnmoni@xrnmoni`.
 
 Tests: `python -m unittest discover tests` covers the manifest and the package;
 with Playwright installed, `tests/test_extension_chromium.py` also loads the

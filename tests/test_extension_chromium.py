@@ -17,6 +17,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from agent_helpers import ROOT, config
+from test_extension import CHROMIUM_ID
 
 import agent
 
@@ -102,6 +103,7 @@ class ChromiumExtensionTest(unittest.TestCase):
                 worker = ctx.service_workers[0] if ctx.service_workers else \
                     ctx.wait_for_event("serviceworker", timeout=10000)
                 ext_id = re.match(r"chrome-extension://([a-p]{32})/", worker.url).group(1)
+                self.assertEqual(ext_id, CHROMIUM_ID)  # from the manifest's key, not the path
                 origin = f"chrome-extension://{ext_id}"
 
                 options = ctx.new_page()

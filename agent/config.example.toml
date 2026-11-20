@@ -29,9 +29,12 @@ bridge_port = 8129
 # secret. Paste the secret into the extension's options page; the page also shows
 # the extension's origin. An origin not listed here is logged once when it posts.
 # Make a secret with: python -c "import secrets; print(secrets.token_urlsafe(24))"
+# The extension's id in Chromium, Chrome, Edge and Brave is fixed (the manifest has a
+# key), so it is listed already; Firefox and Zen give every profile its own
+# moz-extension://<uuid>, so add yours.
 bridge_secret = ""
 bridge_origins = [
-  # "chrome-extension://abcdefghijklmnopabcdefghijklmnop",
+  "chrome-extension://jiogollbnlahboaadnimlllpohpmgnaa",
   # "moz-extension://01234567-89ab-cdef-0123-456789abcdef",
 ]
 

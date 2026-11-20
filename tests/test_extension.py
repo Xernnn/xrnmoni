@@ -1,5 +1,7 @@
 """The extension folder loads in Chromium and in Firefox/Zen, and packages to a zip and an
 unsigned .xpi."""
+import base64
+import hashlib
 import json
 import os
 import re
@@ -12,6 +14,8 @@ import zipfile
 from agent_helpers import ROOT
 
 EXT = os.path.join(ROOT, "extension")
+# What Chromium calls the extension, from the public key in the manifest (README, config)
+CHROMIUM_ID = "jiogollbnlahboaadnimlllpohpmgnaa"
 PACKAGE = os.path.join(ROOT, "scripts", "package-extension.py")
 
 
@@ -28,10 +32,17 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(bg["service_worker"], "background.js")   # Chromium
         self.assertEqual(bg["scripts"], ["background.js"])         # Firefox / Zen event page
         gecko = m["browser_specific_settings"]["gecko"]
-        self.assertRegex(gecko["id"], r"^xrnmoni@")                # a fixed add-on id
+        self.assertEqual(gecko["id"], "xrnmoni@xrnmoni")            # a fixed add-on id
         self.assertGreaterEqual(int(gecko["strict_min_version"].split(".")[0]), 128)
         self.assertEqual(gecko["data_collection_permissions"], {"required": ["none"]})
         self.assertNotIn("update_url", m)
+
+    def test_the_key_gives_chromium_a_fixed_id(self):
+        # an unpacked extension's id is otherwise a hash of its folder's path
+        digest = hashlib.sha256(base64.b64decode(manifest()["key"])).hexdigest()[:32]
+        self.assertEqual("".join(chr(ord("a") + int(c, 16)) for c in digest), CHROMIUM_ID)
+        with open(os.path.join(ROOT, "agent", "config.example.toml"), encoding="utf-8") as f:
+            self.assertIn(f'"chrome-extension://{CHROMIUM_ID}"', f.read())
 
     def test_every_file_the_manifest_names_exists(self):
         m = manifest()
