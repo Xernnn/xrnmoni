@@ -191,6 +191,17 @@ def boot_time():
         return psutil.boot_time()
 
 
+def elapsed_seconds():
+    """Seconds since Windows started, sleep included, unmoved when the clock is set: what
+    CLOCK_BOOTTIME is on Linux. The agent calls a gap in wall time sleep only when this
+    clock saw it too, so the time service setting the clock forward isn't sleep."""
+    try:
+        return _get_api().tick_count64() / 1000.0
+    except Exception as e:
+        _warn_once("tick count", e)
+        return time.time()
+
+
 def is_locked():
     """True when the session is locked (or switched away from), False when it is in use,
     None when Windows can't tell us."""

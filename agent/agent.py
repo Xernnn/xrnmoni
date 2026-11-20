@@ -507,9 +507,14 @@ def pieces(start, end):
     return out
 
 
-def elapsed_clock():
-    """Seconds that keep counting while the machine is suspended. Linux's monotonic
-    clock stops during suspend, CLOCK_BOOTTIME doesn't; elsewhere use wall time."""
+def elapsed_clock(platform=backend):
+    """Seconds that keep counting while the machine is suspended and stay put when the
+    clock is set. Windows: GetTickCount64 (the backend's elapsed_seconds). Linux:
+    CLOCK_BOOTTIME (its monotonic clock stops during suspend). Elsewhere wall time, where
+    setting the clock forward looks like a sleep."""
+    ticks = getattr(platform, "elapsed_seconds", None)
+    if ticks:
+        return ticks()
     if hasattr(time, "CLOCK_BOOTTIME"):
         return time.clock_gettime(time.CLOCK_BOOTTIME)
     return time.time()
@@ -529,12 +534,12 @@ class Tracker:
     A jump of the wall clock alone (the time was set) ends the interval the same way
     without inventing a sleep."""
 
-    def __init__(self, cfg, put_many, backend, now=time.time, clock=elapsed_clock):
+    def __init__(self, cfg, put_many, backend, now=time.time, clock=None):
         self.cfg = cfg
         self.put_many = put_many
         self.backend = backend
         self.now = now
-        self.clock = clock
+        self.clock = clock or (lambda: elapsed_clock(backend))
         # the open interval; "start" is where its unsent part begins
         self.cur = None  # {"type", "app", "title", "start"}
         self.last = None  # (wall, elapsed) at the previous tick

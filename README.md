@@ -178,6 +178,9 @@ token from `python3 server/xrnmoni.py token add <device> --data DIR` on the hub.
   capped by `spool_max_days` / `spool_max_rows`, oldest first.
 - A suspend (or the agent being stopped) is noticed when the loop wakes to more wall
   time than it slept: the gap is recorded as `sleep`, not as time in the last window.
+  A clock that counts through suspend but not clock changes (`CLOCK_BOOTTIME` on
+  Linux, `GetTickCount64` on Windows) must see the gap too, so setting the clock
+  forward ends the interval without inventing a sleep.
 
 **Platform notes**
 

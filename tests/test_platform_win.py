@@ -11,6 +11,7 @@ import os
 import signal
 import sys
 import threading
+import time
 import unittest
 import unittest.mock
 
@@ -354,6 +355,16 @@ class NoPywin32Test(unittest.TestCase):
             self.assertNotIn("pywin32", f.read())
 
 
+class ElapsedTest(Base):
+    def test_elapsed_seconds_is_the_64_bit_tick_count(self):
+        self.api.ticks64 = 50 * 86400 * 1000 + 500   # past where GetTickCount wraps
+        self.assertEqual(50 * 86400 + 0.5, platform_win.elapsed_seconds())
+
+    def test_elapsed_seconds_never_raises(self):
+        self.api.raise_on.add("tick_count64")
+        self.assertIsInstance(platform_win.elapsed_seconds(), float)
+
+
 class BootTimeTest(Base):
     def test_boot_time_is_the_clock_minus_the_64_bit_tick_count(self):
         # psutil's is the clock minus the uptime in whole seconds, so it moved by up to a
@@ -385,6 +396,8 @@ class RealWin32Test(unittest.TestCase):
         self.assertIn(platform_win.is_locked(), (True, False, None))
         import psutil
         self.assertLess(abs(platform_win.boot_time() - psutil.boot_time()), 5)
+        self.assertGreater(platform_win.elapsed_seconds(), 0.0)
+        self.assertLess(abs(platform_win.boot_time() + platform_win.elapsed_seconds() - time.time()), 1)
         print(f"\n[real win32] app={app!r} title={title!r} idle={idle} locked={platform_win.is_locked()}")
 
     def test_own_process_name(self):

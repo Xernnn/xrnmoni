@@ -7,6 +7,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+import unittest.mock
 
 from agent_helpers import AGENT, config
 
@@ -134,6 +135,51 @@ class GapTest(TrackerTest):
             self.assertGreater(b, a)
         self.assertEqual(self.spans("app")[0], ("app", 0, 8))
         self.assertLessEqual(sum(b - a for _, a, b in self.spans("app")), 8 + 4 + 4)
+
+
+class WindowsTime:
+    """The time module as Windows has it, no CLOCK_BOOTTIME, with the test's wall clock."""
+
+    def __init__(self, wall):
+        self.wall = wall
+
+    def time(self):
+        return self.wall()
+
+    def __getattr__(self, name):
+        if name == "CLOCK_BOOTTIME":
+            raise AttributeError(name)
+        return getattr(time, name)
+
+
+class ElapsedClockTest(unittest.TestCase):
+    """The gap check's second clock counts through suspend and ignores the clock being set."""
+
+    def test_which_clock(self):
+        ticks = FakeBackend()
+        ticks.elapsed_seconds = lambda: 1234.5      # Windows: GetTickCount64
+        with unittest.mock.patch.object(agent, "time", WindowsTime(lambda: T0)):
+            self.assertEqual(1234.5, agent.elapsed_clock(ticks))
+            self.assertEqual(T0, agent.elapsed_clock(FakeBackend()))   # nothing better: wall time
+        if hasattr(time, "CLOCK_BOOTTIME"):                            # Linux
+            self.assertAlmostEqual(time.clock_gettime(time.CLOCK_BOOTTIME),
+                                   agent.elapsed_clock(FakeBackend()), delta=1)
+
+    def test_setting_the_clock_forward_on_windows_is_not_sleep(self):
+        # Windows' elapsed clock was the wall clock itself, so both clocks always agreed: the
+        # time service setting the clock 30 s forward was recorded as 30 s of sleep.
+        wall, ticks, events = Clock(T0), Clock(5000.0), []
+        backend = FakeBackend()
+        backend.elapsed_seconds = ticks
+        with unittest.mock.patch.object(agent, "time", WindowsTime(wall)):
+            tracker = agent.Tracker(config(poll_interval=2.0), events.extend, backend, now=wall)
+            for jump in (0, 0, 0, 30, 0, 0, 600):    # set forward 30 s; then a real sleep
+                wall.t += 2 + jump
+                ticks.t += 2 + (jump if jump == 600 else 0)
+                tracker.tick()
+            tracker.close()
+        sleep = [(e["ts_start"] - T0, e["ts_end"] - T0) for e in events if e["type"] == "sleep"]
+        self.assertEqual((42, 644), (sleep[0][0], sleep[-1][1]))   # the real sleep, and only it
 
 
 FAKE_MAIN = textwrap.dedent("""
