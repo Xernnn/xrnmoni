@@ -9,7 +9,9 @@
         bridge_secret, from the origin Chrome gives the extension (from the key in
         extension/manifest.json, not from the config) and from each ORIGIN
     python check.py processes PID [PID ...] [--uac-off]
-        not elevated (unless UAC is off, when nothing can be), no console, GUI exe
+        not elevated by the task (a full token from a split one), no console, GUI exe; an
+        account with no split token (UAC off, or the built-in Administrator as on hosted
+        runners) runs everything elevated, which is reported and not counted
     python check.py exe PATH                          windowed exe with its CA bundle
     python check.py toml FILE EXPECTED_JSON           FILE has the keys and values in EXPECTED_JSON
 """
@@ -114,14 +116,20 @@ def processes(a):
     for pid in a.pids:
         p = psutil.Process(pid)
         h = k32.OpenProcess(0x1000, False, pid)            # PROCESS_QUERY_LIMITED_INFORMATION
-        tok, elevated, n = w.HANDLE(), w.DWORD(), w.DWORD()
+        tok, elevated, kind, n = w.HANDLE(), w.DWORD(), w.DWORD(), w.DWORD()
         adv.OpenProcessToken(h, 0x0008, ctypes.byref(tok))  # TOKEN_QUERY
         adv.GetTokenInformation(tok, 20, ctypes.byref(elevated), 4, ctypes.byref(n))  # TokenElevation
+        adv.GetTokenInformation(tok, 18, ctypes.byref(kind), 4, ctypes.byref(n))  # TokenElevationType
+        # 1 Default: the account has no limited token to give (UAC off, or the built-in
+        # Administrator, as on GitHub's runners), so a task's "Limited" run level can't apply.
+        # 2 Full: elevated out of a split token, which only a "Highest" task does. 3 Limited.
+        forced = bool(elevated.value) and (kind.value == 2 or (kind.value != 1 and not a.uac_off))
         consoles = [c.pid for c in p.children() if c.name().lower() == "conhost.exe"]
         sub = subsystem(p.exe())
         print(f"pid {pid}: {p.exe()} elevated={bool(elevated.value)} "
+              f"elevation type={ {1: 'default (no split token)', 2: 'full', 3: 'limited'}.get(kind.value, kind.value) } "
               f"subsystem={'GUI' if sub == GUI else sub} console hosts={consoles}")
-        bad += (bool(elevated.value) and not a.uac_off) or sub != GUI or bool(consoles)
+        bad += forced or sub != GUI or bool(consoles)
     return 1 if bad else 0
 
 
