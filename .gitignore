@@ -12,6 +12,7 @@ env/
 # xrnmoni runtime secrets & data — NEVER commit these
 agent/config.toml
 windows/token.txt
+server/deploy.local
 *.db
 *.sqlite3
 *.log

@@ -1,0 +1,4 @@
+#!/bin/sh
+# A runit run file for the hub, for setting one up by hand (server/deploy.sh writes its own).
+# Copy to <service folder>/xrnmoni/run, change the paths, and chmod 755.
+exec python3 /opt/xrnmoni/xrnmoni.py --host 127.0.0.1 --port 5240 --data /opt/xrnmoni/data 2>&1
