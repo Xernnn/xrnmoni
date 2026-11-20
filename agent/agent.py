@@ -77,10 +77,16 @@ def valid_id(value):
     return isinstance(value, str) and bool(_ID.fullmatch(value))
 
 
-def boot_event(device, boot_time):
-    # every start reports the same boot; one id per boot keeps it to one row
-    return {"id": derived_id("boot", device, int(boot_time)), "type": "boot",
-            "ts_start": boot_time}
+BOOT_ROUND_S = 10
+
+
+def boot_event(device, boot_time, boot_id=None):
+    """The boot the agent runs in: every start reports it, and one id per boot keeps it to
+    one row. Linux names each boot (boot_id). Elsewhere the boot time stands for it, to the
+    nearest BOOT_ROUND_S: it is the clock minus the uptime, which moves a little from one
+    start to the next."""
+    key = boot_id or round(boot_time / BOOT_ROUND_S)
+    return {"id": derived_id("boot", device, key), "type": "boot", "ts_start": boot_time}
 
 
 DEVICE_NAME = re.compile(r"[^\x00-\x1f\x7f]{1,64}")
@@ -662,7 +668,8 @@ def main():
     sender.start()
 
     # report real boot time once
-    sender.put(boot_event(cfg.device, psutil.boot_time()))
+    boot_id = getattr(backend, "boot_id", lambda: None)()
+    sender.put(boot_event(cfg.device, getattr(backend, "boot_time", psutil.boot_time)(), boot_id))
 
     tracker = Tracker(cfg, sender.put_many, backend)
     bridge = BrowserBridge(cfg, sender, tracker)

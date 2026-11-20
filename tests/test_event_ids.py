@@ -42,6 +42,28 @@ class EventIdTest(unittest.TestCase):
         self.assertNotEqual(a["id"], agent.boot_event("pc", 1.7e9 + 60)["id"])
         self.assertNotEqual(a["id"], agent.boot_event("other", 1.7e9)["id"])
 
+    def test_a_boot_time_that_moves_by_a_second_is_still_the_same_boot(self):
+        # The boot time is worked out as the clock minus the uptime, so it moves by a second
+        # or so from one start to the next, and each such start made a boot row of its own.
+        a = agent.boot_event("pc", 1.7e9 + 0.6)
+        self.assertEqual(a["id"], agent.boot_event("pc", 1.7e9 + 1.4)["id"])
+        self.assertEqual(1.7e9 + 0.6, a["ts_start"])
+
+    def test_a_boot_the_kernel_names_is_known_by_that_name(self):
+        name = "0b6f2c4e-1d7a-4f39-9c8e-5a2b7d4e6f10"
+        a = agent.boot_event("pc", 1.7e9, name)
+        self.assertEqual(a["id"], agent.boot_event("pc", 1.7e9 + 9, name)["id"])   # a clock step
+        self.assertNotEqual(a["id"], agent.boot_event("pc", 1.7e9, name.replace("0b", "0c"))["id"])
+        self.assertNotEqual(a["id"], agent.boot_event("other", 1.7e9, name)["id"])
+
+    def test_linux_reads_the_boot_id(self):
+        import platform_linux
+        path = os.path.join(tempfile.mkdtemp(), "boot_id")
+        with open(path, "w") as f:
+            f.write("0b6f2c4e-1d7a-4f39-9c8e-5a2b7d4e6f10\n")
+        self.assertEqual("0b6f2c4e-1d7a-4f39-9c8e-5a2b7d4e6f10", platform_linux.boot_id(path))
+        self.assertIsNone(platform_linux.boot_id(path + ".missing"))
+
 
 class BridgeIdTest(unittest.TestCase):
     ORIGIN = "chrome-extension://abcdefghijklmnopabcdefghijklmnop"

@@ -17,6 +17,7 @@ import ntpath
 import re
 import signal
 import threading
+import time
 
 NAME = "win32"
 log = logging.getLogger("xrnmoni.platform_win")
@@ -176,6 +177,18 @@ def get_idle_seconds():
     if diff >= 0x80000000:
         diff = 0
     return diff / 1000.0
+
+
+def boot_time():
+    """When Windows started, to the tick: the clock minus GetTickCount64, which counts on
+    through sleep. psutil's is the clock minus the uptime in whole seconds, so it moves by up
+    to a second from one start of the agent to the next."""
+    try:
+        return time.time() - _get_api().tick_count64() / 1000.0
+    except Exception as e:
+        _warn_once("boot time", e)
+        import psutil
+        return psutil.boot_time()
 
 
 def is_locked():
@@ -356,6 +369,7 @@ class _Win32:
         proto(u.TranslateMessage, w.BOOL, ctypes.POINTER(w.MSG))
         proto(u.DispatchMessageW, LRESULT, ctypes.POINTER(w.MSG))
         proto(k.GetTickCount, w.DWORD)
+        proto(k.GetTickCount64, ctypes.c_uint64)
         proto(k.OpenProcess, w.HANDLE, w.DWORD, w.BOOL, w.DWORD)
         proto(k.CloseHandle, w.BOOL, w.HANDLE)
         proto(k.QueryFullProcessImageNameW, w.BOOL, w.HANDLE, w.DWORD, w.LPWSTR,
@@ -449,6 +463,9 @@ class _Win32:
 
     def tick_count(self):
         return self.kernel32.GetTickCount()
+
+    def tick_count64(self):
+        return self.kernel32.GetTickCount64()   # ms since boot, sleep included; never wraps
 
     def session_locked(self):
         buf, size = ctypes.c_void_p(), self.w.DWORD()

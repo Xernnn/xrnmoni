@@ -12,6 +12,7 @@ import signal
 import sys
 import threading
 import unittest
+import unittest.mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "agent"))
@@ -28,6 +29,7 @@ class FakeWin32:
         self.aumids = {}     # pid -> AppUserModelID
         self.last_input = 0
         self.ticks = 0
+        self.ticks64 = 0
         self.lock = False    # True / False / None, or an exception
         self.raise_on = set()
 
@@ -74,6 +76,10 @@ class FakeWin32:
 
     def tick_count(self):
         return self.ticks
+
+    def tick_count64(self):
+        self._maybe_raise("tick_count64")
+        return self.ticks64
 
     def session_locked(self):
         if isinstance(self.lock, BaseException):
@@ -348,6 +354,20 @@ class NoPywin32Test(unittest.TestCase):
             self.assertNotIn("pywin32", f.read())
 
 
+class BootTimeTest(Base):
+    def test_boot_time_is_the_clock_minus_the_64_bit_tick_count(self):
+        # psutil's is the clock minus the uptime in whole seconds, so it moved by up to a
+        # second from one start of the agent to the next.
+        self.api.ticks64 = 3 * 86400 * 1000 + 250   # 3 days, 0.25 s: past the 32-bit wrap
+        with unittest.mock.patch.object(platform_win.time, "time", return_value=1.7e9):
+            self.assertAlmostEqual(1.7e9 - 3 * 86400 - 0.25, platform_win.boot_time(), places=3)
+
+    def test_boot_time_falls_back_to_psutil(self):
+        self.api.raise_on.add("tick_count64")
+        with unittest.mock.patch("psutil.boot_time", return_value=1.6e9):
+            self.assertEqual(1.6e9, platform_win.boot_time())
+
+
 @unittest.skipUnless(sys.platform == "win32", "needs Windows")
 class RealWin32Test(unittest.TestCase):
     """One pass over the real API (CI's windows-latest job): right types, no exceptions."""
@@ -363,6 +383,8 @@ class RealWin32Test(unittest.TestCase):
         self.assertIsInstance(idle, float)
         self.assertGreaterEqual(idle, 0.0)
         self.assertIn(platform_win.is_locked(), (True, False, None))
+        import psutil
+        self.assertLess(abs(platform_win.boot_time() - psutil.boot_time()), 5)
         print(f"\n[real win32] app={app!r} title={title!r} idle={idle} locked={platform_win.is_locked()}")
 
     def test_own_process_name(self):

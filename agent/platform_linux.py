@@ -680,6 +680,16 @@ def sleep_started():
     return watcher.sleep_since if watcher else None
 
 
+def boot_id(path="/proc/sys/kernel/random/boot_id"):
+    """The kernel's name for this boot: the same on every read until the next boot, which the
+    boot time isn't quite. None if it can't be read."""
+    try:
+        with open(path, encoding="ascii") as f:
+            return f.read().strip() or None
+    except (OSError, ValueError):
+        return None
+
+
 def get_idle_seconds():
     source = _pick_idle_source()
     if source == "wayland":
