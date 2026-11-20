@@ -667,7 +667,7 @@ class Categories:
 # ---- device tokens ------------------------------------------------------------------------------
 
 class Tokens:
-    """What an agent posts with instead of a password: `xrnmoni_<id>_<secret>`, one per device, made
+    """What an agent posts with in place of a password, shaped `xrnmoni_<id>_<secret>`, one per device, made
     and revoked with `xrnmoni.py token`. Only a SHA-256 of the secret is kept, in tokens.json, so a
     copy of that file posts nothing; the secret is 32 random bytes, which no guessing reaches, so a
     fast hash is enough. A token posts events under its own device's name and reads nothing.
