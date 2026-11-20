@@ -3,9 +3,10 @@
 # Where the central server is reachable from THIS machine.
 # Use the server's LAN IP (or hostname / tailscale name), not localhost,
 # unless the server runs on this same machine.
-server_url = "http://192.168.1.10:8000"
+server_url = "http://192.168.1.10:5240"
 
-# Must match XRNMONI_TOKEN on the server.
+# A device token from `xrnmoni.py token add <device>` on the hub
+# (the old shared XRNMONI_TOKEN still works).
 token = "change-me"
 
 # Friendly name shown in the dashboard. Defaults to the hostname if omitted.
@@ -17,9 +18,37 @@ poll_interval = 2.0
 # How often to flush buffered events to the server, in seconds.
 flush_interval = 10.0
 
-# Mark time as idle/AFK after this many seconds with no input.
-# (X11 + xprintidle, or Windows. Not available on Hyprland/Wayland.)
+# Mark time as idle after this many seconds with no input. Idle time is recorded as
+# "idle" and isn't counted to any app or page. Sources: Windows; on Linux the Wayland
+# idle protocol (Hyprland, Sway, KDE), else xprintidle on X11, else logind's IdleHint.
 afk_threshold = 60.0
 
-# Localhost port the browser extension posts to. Match extension config.
+# Localhost port the browser extension posts to. Match the extension's options.
 bridge_port = 8129
+
+# The browser bridge takes posts only from these extension origins, carrying this
+# secret. Paste the secret into the extension's options page; the page also shows
+# the extension's origin. An origin not listed here is logged once when it posts.
+# Make a secret with: python -c "import secrets; print(secrets.token_urlsafe(24))"
+# The extension's id in Chromium, Chrome, Edge and Brave is fixed (the manifest has a
+# key), so it is listed already; Firefox and Zen give every profile its own
+# moz-extension://<uuid>, so add yours.
+bridge_secret = ""
+bridge_origins = [
+  "chrome-extension://jiogollbnlahboaadnimlllpohpmgnaa",
+  # "moz-extension://01234567-89ab-cdef-0123-456789abcdef",
+]
+
+# Page addresses are stored without their ?query and #fragment (search terms,
+# session tokens, message ids). true keeps them.
+keep_url_query = false
+
+# Events wait in this SQLite file until the server has them, so restarts and server
+# outages lose nothing. Default: $XDG_STATE_HOME/xrnmoni/spool.sqlite
+# (~/.local/state/...) on Linux, %LOCALAPPDATA%\xrnmoni\spool.sqlite on Windows.
+# spool_path = "~/.local/state/xrnmoni/spool.sqlite"
+
+# While the server is unreachable the spool keeps at most this much; past it the
+# oldest events are dropped first.
+spool_max_days = 30
+spool_max_rows = 200000

@@ -1,73 +1,18 @@
-"""Security checks for the server, the dashboard page and the agent's browser bridge.
+"""Security checks for the agent's browser bridge. The server's are in server/test_xrnmoni.py.
 
-    pip install -r server/requirements.txt -r agent/requirements.txt httpx
+    pip install -r agent/requirements.txt
     python -m unittest discover tests
 """
 import http.client
 import importlib
 import os
 import queue
-import subprocess
 import sys
-import tempfile
 import threading
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SERVER = os.path.join(ROOT, "server")
 AGENT = os.path.join(ROOT, "agent")
-
-
-class ServerTokenTest(unittest.TestCase):
-    def start(self, token):
-        env = dict(os.environ)
-        env.pop("XRNMONI_TOKEN", None)
-        if token is not None:
-            env["XRNMONI_TOKEN"] = token
-        return subprocess.run([sys.executable, "-c", "import main"], cwd=SERVER, env=env,
-                              capture_output=True, text=True)
-
-    def test_refuses_to_start_without_a_real_token(self):
-        for token in (None, "", "change-me"):
-            with self.subTest(token=token):
-                r = self.start(token)
-                self.assertNotEqual(r.returncode, 0)
-                self.assertIn("XRNMONI_TOKEN", r.stderr)
-
-    def test_starts_with_a_token(self):
-        self.assertEqual(self.start("a-long-random-test-token-123").returncode, 0)
-
-
-class ServerApiTest(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        os.environ["XRNMONI_TOKEN"] = "a-long-random-test-token-123"
-        os.environ["XRNMONI_DB"] = os.path.join(tempfile.mkdtemp(), "test.db")
-        sys.path.insert(0, SERVER)
-        from fastapi.testclient import TestClient
-        cls.main = importlib.import_module("main")
-        cls.client = TestClient(cls.main.app)
-
-    def test_api_needs_the_exact_token(self):
-        self.assertEqual(self.client.get("/api/devices").status_code, 401)
-        bad = {"Authorization": "Bearer a-long-random-test-token-12"}
-        self.assertEqual(self.client.get("/api/devices", headers=bad).status_code, 401)
-        good = {"Authorization": "Bearer a-long-random-test-token-123"}
-        self.assertEqual(self.client.get("/api/devices", headers=good).status_code, 200)
-
-    def test_dashboard_csp_allows_only_its_own_script(self):
-        r = self.client.get("/")
-        csp = r.headers["content-security-policy"]
-        self.assertIn("default-src 'none'", csp)
-        self.assertIn("connect-src 'self'", csp)
-        self.assertIn("script-src 'sha256-", csp)
-        self.assertNotIn("unsafe-inline' ;", csp.split("script-src")[1].split(";")[0] + " ;")
-
-    def test_dashboard_escapes_data_before_using_innerHTML(self):
-        html = self.client.get("/").text
-        self.assertIn("const esc = ", html)
-        for raw in ("${dev.device}", "${dev.os", "${e.title", "${i.name", "${e.type}</span>"):
-            self.assertNotIn(raw, html)
 
 
 class BridgeTest(unittest.TestCase):
@@ -78,6 +23,8 @@ class BridgeTest(unittest.TestCase):
 
         class Cfg:
             bridge_port = 0
+            bridge_origins = ["chrome-extension://abcdefghijklmnopabcdefghijklmnop"]
+            bridge_secret = "a-test-bridge-secret"
 
         class Sender:
             def __init__(self):
@@ -95,9 +42,10 @@ class BridgeTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.bridge.shutdown()
 
-    def post(self, origin, body=b'{"url":"https://example.com","title":"t"}'):
+    def post(self, origin, body=b'{"url":"https://example.com","title":"t",'
+                                b'"ts_start":1700000000,"ts_end":1700000010}'):
         c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", "X-Xrnmoni-Secret": "a-test-bridge-secret"}
         if origin:
             headers["Origin"] = origin
         c.request("POST", "/browser", body, headers)

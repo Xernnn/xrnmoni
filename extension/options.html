@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>xrnmoni web tracker</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font: 14px system-ui, sans-serif; margin: 24px auto; max-width: 520px; padding: 0 16px; }
+    label { display: block; margin: 14px 0 4px; font-weight: 600; }
+    input { width: 100%; box-sizing: border-box; padding: 6px 8px; font: inherit; }
+    code { user-select: all; word-break: break-all; }
+    button { margin-top: 14px; padding: 6px 14px; font: inherit; }
+  </style>
+</head>
+<body>
+  <h1>xrnmoni</h1>
+  <label for="port">Port</label>
+  <input id="port" type="number" min="1" max="65535">
+  <label for="secret">Secret</label>
+  <input id="secret" type="password" autocomplete="off" spellcheck="false">
+  <button id="save" type="button">Save</button> <span id="saved"></span>
+  <label>Origin</label>
+  <code id="origin"></code>
+  <label>Last post</label>
+  <span id="last"></span>
+  <script src="options.js"></script>
+</body>
+</html>
