@@ -163,8 +163,9 @@ prints (`... xrnmoni.py user add <name> --data ...`), then open `http://127.0.0.
 
 For other machines to reach it, `-HubBind <this PC's LAN or Tailscale address>`. Windows
 Firewall then asks an administrator once; allow private networks only. The hub speaks
-plain HTTP: use it over Tailscale or behind an HTTPS proxy, and to sign in to its
-dashboard over plain HTTP add `-HubArgs '--insecure-cookie'`.
+plain HTTP: use it over Tailscale or behind an HTTPS proxy. Signing in to its dashboard
+works over plain HTTP from another machine as it is (the sign-in cookie isn't marked
+Secure then). `-HubArgs` passes more of the hub's options, such as `'--viewer sam'`.
 
 ## 9. If something is wrong
 

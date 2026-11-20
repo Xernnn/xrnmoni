@@ -20,8 +20,8 @@
 # windows\ or in windows\dist\, or takes -ExePath.
 #
 # -WithHub also runs a hub on this PC (python server\xrnmoni.py, listening on 127.0.0.1:5240
-# only; -HubBind <address> to let other machines in, -HubArgs '--insecure-cookie ...' for more
-# of its options) and points the agent at it.
+# only; -HubBind <address> to let other machines in, -HubArgs '--viewer sam ...' for more of
+# its options) and points the agent at it.
 
 [CmdletBinding()]
 param(
@@ -191,8 +191,7 @@ if ($WithHub) {
     if ($HubBind -ne '127.0.0.1' -and $HubBind -ne 'localhost' -and $HubBind -ne '::1') {
         Write-Host ("The hub will listen on ${HubBind}:${HubPort}, so other machines can reach it. Windows " +
                     'Firewall asks an administrator the first time; allow it only for private networks. ' +
-                    'It speaks plain HTTP: use it over Tailscale or put an HTTPS proxy in front. To sign in ' +
-                    "to its dashboard over plain HTTP it needs -HubArgs '--insecure-cookie'.") -ForegroundColor Yellow
+                    'It speaks plain HTTP: use it over Tailscale or put an HTTPS proxy in front.') -ForegroundColor Yellow
     }
 }
 

@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -170,6 +171,34 @@ class BrowserBridgeTest(unittest.TestCase):
             ci = f.read()
         self.assertNotRegex(ci, r"-BridgeOrigin\s+['\"]?chrome-extension://")
         self.assertIn("check.py bridge", ci)
+
+
+class HubOptionsTest(unittest.TestCase):
+    """-WithHub runs server/xrnmoni.py with options the scripts and the guide name."""
+
+    def hub_options(self):
+        found = set()
+        for sub in ([], ["user"], ["token"]):
+            r = subprocess.run([sys.executable, os.path.join(ROOT, "server", "xrnmoni.py"), *sub, "--help"],
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(0, r.returncode, r.stderr)
+            found |= set(re.findall(r"(?<![\w-])--[a-z][a-z0-9-]*", r.stdout))
+        return found
+
+    def test_every_hub_option_mentioned_exists(self):
+        # install.ps1 and the guide told people to add -HubArgs '--insecure-cookie', which the
+        # hub doesn't have: argparse exits with 2, so the hub task never came up.
+        mentioned = {}
+        paths = scripts("*.ps1", "*.bat", "*.md") + [os.path.join(ROOT, ".github", "workflows", "ci.yml")]
+        for path in paths:
+            with open(path, encoding="utf-8-sig") as f:
+                for n, line in enumerate(f, 1):
+                    if re.search(r"(?i)xrnmoni\.py|XrnHubScript|HubArgs", line):
+                        for opt in re.findall(r"(?<![\w-])--[a-z][a-z0-9-]*", line):
+                            mentioned.setdefault(opt, []).append(f"{os.path.basename(path)}:{n}")
+        self.assertIn("--data", mentioned)   # the scan sees them
+        known = self.hub_options()
+        self.assertEqual({}, {o: where for o, where in mentioned.items() if o not in known})
 
 
 class LogonTaskTest(unittest.TestCase):
