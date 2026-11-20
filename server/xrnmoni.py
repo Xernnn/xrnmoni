@@ -155,15 +155,25 @@ class LogFile:
         self.f = open(path, "a", encoding="utf-8")
 
     def write(self, text):
+        # Logging never stops a request: on Windows the rename fails while another program holds
+        # the log open (an editor, Get-Content -Wait), and a full disk fails the write. The file
+        # is opened again then, and the next line past LOG_MAX tries the rename again.
         with self.lock:
-            stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S ")
-            lines = text.splitlines(keepends=True)
-            self.f.write("".join(stamp + line for line in lines))
-            self.f.flush()
-            if self.f.tell() > LOG_MAX:
-                self.f.close()
-                os.replace(self.path, self.path + ".1")
-                self.f = open(self.path, "a", encoding="utf-8")
+            try:
+                if self.f.closed:
+                    self.f = open(self.path, "a", encoding="utf-8")
+                stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S ")
+                lines = text.splitlines(keepends=True)
+                self.f.write("".join(stamp + line for line in lines))
+                self.f.flush()
+                if self.f.tell() > LOG_MAX:
+                    self.f.close()
+                    try:
+                        os.replace(self.path, self.path + ".1")
+                    finally:
+                        self.f = open(self.path, "a", encoding="utf-8")
+            except OSError:
+                pass
         return len(text)
 
     def flush(self):

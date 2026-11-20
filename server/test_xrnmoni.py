@@ -958,6 +958,43 @@ class WebTest(HubTest):
             self.assertEqual(404, self.call("GET", path, auth=None)[0], path)
 
 
+class LogFileTest(HubTest):
+    """With no console the log is a file; nothing that goes wrong with it may stop the hub."""
+
+    def logging_to_a_file(self):
+        path = os.path.join(self.data, "xrnmoni.log")
+        logfile = srv.LogFile(path)
+        self.addCleanup(lambda: logfile.f.close())
+        patch = unittest.mock.patch.object(sys, "stderr", logfile)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return path, logfile
+
+    def test_a_log_that_cant_be_renamed_keeps_the_hub_answering(self):
+        # On Windows the log can't be renamed while another program holds it open (an editor,
+        # Get-Content -Wait). The file had been closed already, so every later line, and every
+        # later request with it, failed with "I/O operation on closed file".
+        path, _ = self.logging_to_a_file()
+        real_replace = os.replace
+
+        def replace(src, dst):
+            if src == path:
+                raise PermissionError(13, "The process cannot access the file", src)
+            return real_replace(src, dst)
+        with unittest.mock.patch.object(srv, "LOG_MAX", 200):
+            with unittest.mock.patch.object(srv.os, "replace", replace):
+                for _ in range(5):
+                    self.assertEqual(200, self.call("GET", "/healthz", auth=None)[0])
+            self.assertEqual(200, self.call("GET", "/healthz", auth=None)[0])   # it rotates once it can
+        with open(path + ".1", encoding="utf-8") as f:
+            self.assertEqual(6, f.read().count('"GET /healthz HTTP/1.1" 200'))
+
+    def test_a_full_disk_doesnt_stop_the_hub(self):
+        _, logfile = self.logging_to_a_file()
+        with unittest.mock.patch.object(logfile.f, "write", side_effect=OSError(28, "No space left on device")):
+            self.assertEqual(200, self.call("GET", "/healthz", auth=None)[0])
+
+
 class ProcessTest(unittest.TestCase):
     """The program as it's run: under pythonw on Windows there is no console at all."""
 
