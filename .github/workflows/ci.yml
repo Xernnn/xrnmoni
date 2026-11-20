@@ -134,6 +134,16 @@ jobs:
           Write-Host '::error::the hub did not answer'
           exit 1
 
+      # Nobody types on a hosted runner, so after a minute the agent would rightly call the
+      # machine idle, and browser time while idle isn't recorded. A setting added by hand
+      # before installing is kept by install.ps1, as on a real PC.
+      - name: An idle threshold the runner never reaches, so the bridge check has something to record
+        shell: powershell
+        run: |
+          . .\windows\common.ps1
+          New-Item -ItemType Directory -Force -Path (Split-Path $XrnConfig -Parent) | Out-Null
+          [IO.File]::WriteAllText($XrnConfig, "afk_threshold = 315360000.0`r`n", (New-Object System.Text.UTF8Encoding($false)))
+
       - name: install.ps1 - Python found by full path, venv, config, logon task, started
         shell: powershell
         run: >
