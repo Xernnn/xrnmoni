@@ -1,0 +1,20 @@
+# systemd user unit for the xrnmoni agent. linux/install.sh fills in the @...@ paths
+# and installs it as ~/.config/systemd/user/xrnmoni-agent.service.
+#
+# It runs with the graphical session: started once the desktop is up (so Hyprland's
+# and Wayland's sockets are there) and stopped with it. Stopping sends SIGTERM, which
+# makes the agent close the open interval and keep it in its spool.
+[Unit]
+Description=xrnmoni activity agent
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart="@PYTHON@" "@AGENT@" --config "@CONFIG@"
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=15
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=graphical-session.target

@@ -120,13 +120,34 @@ left open while nobody is there doesn't count.
 - Reads need a viewer's password or session; device tokens only post. Wrong
   passwords and tokens count towards a per-address lockout, and writes from another
   site's page are refused.
-- The agent's browser bridge (`127.0.0.1:8129`) accepts posts only from a browser
-  extension's origin, so websites you visit can't feed it made-up activity.
+- The agent's browser bridge (`127.0.0.1:8129`) accepts posts only from the extension
+  origins listed in `bridge_origins` that send the shared `bridge_secret`, so neither
+  websites you visit, other extensions nor other local programs can feed it made-up
+  activity. It checks every field and answers 400 to anything malformed. Page addresses
+  are kept without their `?query` and `#fragment` unless `keep_url_query = true`.
 - Tests: `pip install -r server/requirements.txt -r agent/requirements.txt`, then
   `python -m unittest server/test_xrnmoni.py`, `node --test server/test_web.mjs` and
   `python -m unittest discover tests`.
 
 ## 2. Agent (on each monitored machine)
+
+**Linux** (systemd user service):
+
+```bash
+linux/install.sh
+```
+
+It makes a venv (`agent/.venv`), copies the example config to
+`~/.config/xrnmoni/agent.toml` if there is none (with a fresh `bridge_secret`, which it
+prints for the extension), and installs and enables the user unit
+`xrnmoni-agent.service`. The unit starts with the graphical session and stops with it
+(`WantedBy`/`PartOf=graphical-session.target`), so Hyprland's and Wayland's sockets are
+there when it starts; it restarts on a crash. Edit the config, then
+`systemctl --user start xrnmoni-agent`; the log is
+`journalctl --user -u xrnmoni-agent -f`. Run `install.sh` again after pulling to
+update; it keeps the config and restarts the agent.
+
+**By hand** (any platform):
 
 ```bash
 cd agent
@@ -136,36 +157,49 @@ cp config.example.toml config.toml                # then edit server_url + token
 python agent.py --config config.toml
 ```
 
-Set `server_url` to the hub's LAN IP (e.g. `http://192.168.1.10:8000`) and
-`token` to the same secret. `device` is the friendly name shown in the dashboard.
+Set `server_url` to the hub's LAN IP (e.g. `http://192.168.1.10:8000`), or a URL with
+a path if the server sits behind a proxy (`https://host/xrnmoni`), and `token` to the
+same secret. `device` is the friendly name shown in the dashboard.
+
+**What it records, and how it survives trouble**
+
+- The foreground window (`app`), idle time (`idle`: no input for `afk_threshold`
+  seconds), the locked screen (`locked`) and sleep (`sleep`). One at a time: sleep
+  beats locked, locked beats idle, idle beats the window.
+- Intervals are sent as closed chunks of at most 60 s while they last, and split at
+  local midnight, so a long stay shows up within a minute and day totals add up.
+- Every event goes into a SQLite spool (`spool_path`, default
+  `~/.local/state/xrnmoni/spool.sqlite`, `%LOCALAPPDATA%\xrnmoni\` on Windows) when it
+  is made, and is deleted only after the server took it. A server outage, a restart or
+  a crash loses nothing but the current minute; SIGTERM (systemd stop), Ctrl-C and
+  SIGHUP close the open interval first. Each event has an id, so a resend is not
+  counted twice. Events the server refuses are logged and dropped; the spool is
+  capped by `spool_max_days` / `spool_max_rows`, oldest first.
+- A suspend (or the agent being stopped) is noticed when the loop wakes to more wall
+  time than it slept: the gap is recorded as `sleep`, not as time in the last window.
 
 **Platform notes**
 
 - **Windows** — foreground app + idle work out of the box (pywin32).
-- **Linux / X11** — active window via python-xlib. For idle/AFK detection,
-  install `xprintidle` (`sudo pacman -S xprintidle` on CachyOS/Arch). Without it,
-  app tracking still works but nothing is ever marked idle.
-- **Linux / Hyprland (Wayland)** — active window via `hyprctl`; auto-detected.
-  Idle detection isn't available on Wayland, so `afk_threshold` has no effect.
+- **Linux / Hyprland (Wayland)** — the focused window comes from Hyprland's event
+  socket, so even short switches are seen; auto-detected, also when the agent started
+  before Hyprland. Idle comes from the Wayland idle protocol (ext-idle-notify): the
+  agent asks the compositor to tell it after `afk_threshold` seconds without input. It
+  only listens and never keeps the screen awake; a video that keeps the screen on
+  counts as being there. The lock screen is seen through logind and Hyprland's
+  lock-notify protocol (hyprlock, the Omarchy/Quickshell lock, swaylock), and sleep
+  through logind. The log's first lines say which sources are in use.
+- **Linux / X11** — active window via python-xlib. For idle detection, install
+  `xprintidle` (`sudo pacman -S xprintidle` on CachyOS/Arch); without it the agent
+  falls back to logind's idle hint, which many desktops never set.
 - **Other Wayland (GNOME/KDE)** — compositors don't expose the active window to
   unprivileged clients; the agent logs "unknown". Use an X11 session, or extend
-  `platform_linux.py` with a GNOME-extension / KWin-script bridge.
+  `platform_linux.py` with a GNOME-extension / KWin-script bridge. Idle works where
+  the compositor has ext-idle-notify (KDE does).
 
 **Run it on boot**
 
-- Linux (systemd user service):
-  ```ini
-  # ~/.config/systemd/user/xrnmoni.service
-  [Unit]
-  Description=xrnmoni agent
-  [Service]
-  ExecStart=%h/Documents/Projects/xrnmoni/agent/.venv/bin/python %h/Documents/Projects/xrnmoni/agent/agent.py --config %h/Documents/Projects/xrnmoni/agent/config.toml
-  Restart=always
-  [Install]
-  WantedBy=default.target
-  ```
-  `systemctl --user enable --now xrnmoni` (and `loginctl enable-linger $USER`
-  so it runs without an active graphical login if you want).
+- Linux: `linux/install.sh`, above.
 - Windows: Task Scheduler → "At log on" → run `pythonw.exe agent.py`.
 
 ## 3. Browser extension (for live website tracking)
@@ -178,12 +212,32 @@ never holds the server URL or token.
 
 1. `chrome://extensions` → enable *Developer mode*.
 2. *Load unpacked* → select the `extension/` folder.
-3. If you changed `bridge_port` in the agent config, update `BRIDGE_PORT` in
-   `extension/background.js` to match, then reload the extension.
+3. Open the extension's options: set *Secret* to `bridge_secret` from the agent's
+   config (and *Port* if you changed `bridge_port`), then *Save*.
+4. The manifest's public `key` gives the extension the same id everywhere,
+   `jiogollbnlahboaadnimlllpohpmgnaa`, and the example config already lists
+   `chrome-extension://jiogollbnlahboaadnimlllpohpmgnaa` in `bridge_origins`. An origin
+   that isn't listed is refused, and the agent logs `[bridge] refused …` once with the
+   origin to add. *Last post* on the options page shows what the agent answered
+   (200 = recorded).
 
-**Firefox** — set `"background": { "scripts": ["background.js"] }` in the
-manifest (MV3 event pages) and load it via `about:debugging` → *This Firefox* →
-*Load Temporary Add-on*. `chrome.*` APIs are available as `browser.*`/`chrome.*`.
+**Zen / Firefox** — the same folder works: the manifest names both a service
+worker (Chromium) and an event-page script (Firefox), and has a fixed add-on id.
+
+- Try it: `about:debugging` → *This Firefox* → *Load Temporary Add-on* → pick
+  `extension/manifest.json` (gone after a restart).
+- Keep it: `python scripts/package-extension.py` writes
+  `dist/xrnmoni-extension-<version>.xpi` (and a `.zip` for Chromium). It is unsigned,
+  so set `xpinstall.signatures.required` to `false` in `about:config` (Zen, Firefox
+  Developer Edition, Nightly and ESR honour it), then drag the `.xpi` onto the
+  browser. A newer version is installed the same way.
+- Then set the secret as for Chromium, and add the origin to `bridge_origins`:
+  Firefox's is `moz-extension://<uuid>`, different in every profile (the options
+  page shows it). The add-on id is `xrnmoni@xrnmoni`.
+
+Tests: `python -m unittest discover tests` covers the manifest and the package;
+with Playwright installed, `tests/test_extension_chromium.py` also loads the
+extension in headless Chromium and checks its posts reach the agent's bridge.
 
 MV3 service workers can be suspended; a 30-second heartbeat chunks long sessions
 so at most ~30s is ever lost on suspension.
@@ -192,15 +246,16 @@ so at most ~30s is ever lost on suspension.
 
 ## Data model
 
-All events land in one `events` table:
+All events land in one `events` table. Each carries an `id` (32 hex characters)
+that the agent gives it, and intervals are at most 60 s long:
 
 | type       | meaning                                    | fields used                     |
 |------------|--------------------------------------------|---------------------------------|
 | `app`      | foreground window interval                 | app, title                      |
-| `web`      | active-tab interval (from the extension)   | url, title, domain              |
-| `idle`     | no input                                   |                                 |
+| `web`      | active-tab interval (from the extension; the agent sends `browser`) | url, title, domain |
+| `idle`     | no input for `afk_threshold` s (was `afk`) |                                 |
 | `locked`   | the screen locked                          |                                 |
-| `sleep`    | the machine asleep                         |                                 |
+| `sleep`    | machine asleep, or the agent not running   |                                 |
 | `boot`     | machine boot time (a point: no end)        |                                 |
 | `shutdown` | agent stopping (a point)                   |                                 |
 

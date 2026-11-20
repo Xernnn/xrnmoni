@@ -23,6 +23,8 @@ class BridgeTest(unittest.TestCase):
 
         class Cfg:
             bridge_port = 0
+            bridge_origins = ["chrome-extension://abcdefghijklmnopabcdefghijklmnop"]
+            bridge_secret = "a-test-bridge-secret"
 
         class Sender:
             def __init__(self):
@@ -40,9 +42,10 @@ class BridgeTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.bridge.shutdown()
 
-    def post(self, origin, body=b'{"url":"https://example.com","title":"t"}'):
+    def post(self, origin, body=b'{"url":"https://example.com","title":"t",'
+                                b'"ts_start":1700000000,"ts_end":1700000010}'):
         c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", "X-Xrnmoni-Secret": "a-test-bridge-secret"}
         if origin:
             headers["Origin"] = origin
         c.request("POST", "/browser", body, headers)

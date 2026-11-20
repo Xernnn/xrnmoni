@@ -4,10 +4,11 @@
 // name and forwards them to the central server. The extension never holds the
 // server URL or token.
 //
-// If you changed `bridge_port` in the agent config, change BRIDGE_PORT below.
+// The options page sets the agent's port (bridge_port) and the shared secret
+// (bridge_secret), sent as X-Xrnmoni-Secret; the agent takes posts only from the
+// origins in its bridge_origins that send it.
 
-const BRIDGE_PORT = 8129;
-const BRIDGE_URL = `http://127.0.0.1:${BRIDGE_PORT}/browser`;
+const DEFAULTS = { bridgePort: 8129, bridgeSecret: "" };
 const IDLE_SECONDS = 60;      // match the agent's afk_threshold-ish
 const HEARTBEAT_MIN = 0.5;    // 30s: chunk long sessions + keep SW warm
 
@@ -23,23 +24,41 @@ async function saveCurrent() {
   try { await chrome.storage.session.set({ current }); } catch {}
 }
 
+async function settings() {
+  try { return await chrome.storage.local.get(DEFAULTS); } catch { return DEFAULTS; }
+}
+
+// What the last post got, for the options page.
+async function note(status) {
+  try { await chrome.storage.local.set({ lastPost: { at: Date.now(), status } }); } catch {}
+}
+
 async function post(interval) {
+  const { bridgePort, bridgeSecret } = await settings();
+  if (!bridgeSecret) { await note("no secret set"); return; }
   try {
-    await fetch(BRIDGE_URL, {
+    const r = await fetch(`http://127.0.0.1:${bridgePort}/browser`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "X-Xrnmoni-Secret": bridgeSecret },
       body: JSON.stringify(interval),
     });
+    await note(String(r.status));
   } catch (e) {
     // agent offline — drop it; the agent is the buffering layer, not us
+    await note("agent offline");
   }
 }
 
 function now() { return Date.now() / 1000; }
 
+// Each interval gets an id once, so the agent and the server can tell a resend
+// from a new interval.
+function newId() { return crypto.randomUUID().replaceAll("-", ""); }
+
 async function stop(endTs) {
   if (current && endTs > current.start) {
     await post({
+      id: newId(),
       url: current.url,
       title: current.title,
       domain: current.domain,
@@ -88,7 +107,7 @@ async function heartbeat() {
     const t = now();
     const url = current.url, title = current.title, domain = current.domain, start = current.start;
     if (t > start) {
-      await post({ url, title, domain, ts_start: start, ts_end: t, duration: t - start });
+      await post({ id: newId(), url, title, domain, ts_start: start, ts_end: t, duration: t - start });
       current.start = t;
       await saveCurrent();
     }
