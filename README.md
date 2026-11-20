@@ -22,13 +22,23 @@ Linux laptop┘                      ▼  ▼
                             hub: server (Python + SQLite) + dashboard
 ```
 
+![The dashboard's Day view: a Linux laptop and a Windows PC, each with its day's timeline, top apps, sites and categories](docs/screenshots/day.png)
+
+*A day of two made-up devices: active, idle, locked and asleep time, the timeline (apps
+and away time above, the browser's pages in the thin strip below; hover for what each
+stretch was, click to open it), and the day's apps, sites and categories.*
+
 ## Layout
 
 | Path          | What it is                                            |
 |---------------|-------------------------------------------------------|
-| `server/`     | The hub: ingest + query API, SQLite store, dashboard  |
-| `agent/`      | Cross-platform agent (Windows + Linux)                |
-| `extension/`  | MV3 browser extension for live page tracking          |
+| `server/`     | The hub: `xrnmoni.py` (ingest + query API, SQLite store), the dashboard in `web/`, `deploy.sh`, `demo_server.py` |
+| `agent/`      | Cross-platform agent (Windows + Linux): `agent.py`, `platform_linux.py`, `platform_win.py` |
+| `extension/`  | MV3 browser extension for live page tracking (Chromium and Firefox/Zen) |
+| `linux/`      | `install.sh` and the systemd user unit for the Linux agent |
+| `windows/`    | Per-user Windows installer, start/stop/status scripts, the `.exe` build, and its guide |
+| `scripts/`    | `package-extension.py` (the `.zip` and `.xpi`) |
+| `tests/`      | Agent, bridge, extension and installer tests (the hub's own are in `server/`) |
 
 ---
 
@@ -55,9 +65,10 @@ console, the log (`xrnmoni.log`).
 | `--host` | `127.0.0.1` | `0.0.0.0` (or the machine's Tailscale address) to take other machines' agents directly |
 | `--port` | `5240` | |
 | `--users FILE` | `DIR/users` | an htpasswd file of bcrypt hashes, such as one other services on the same server already share |
-| `--viewer NAME` | | another user in that file who may see the dashboard; the file's first user always may |
+| `--viewer NAME` | | another user in that file who may see the dashboard (give it once per user); the file's first user always may |
 | `--prefix` | `/xrnmoni` | the path a reverse proxy publishes the hub under; paths work with or without it |
 | `--retain-days` | `400` | events older than this are deleted, once a day; `0` keeps everything |
+| `--web DIR` | `web/` beside `xrnmoni.py` | the dashboard's files |
 
 **Logins.** The dashboard asks for a name and password from the users file
 (`user add NAME`, `user remove NAME`, `user list`; the password can also be piped in).
@@ -81,7 +92,9 @@ A hub reached over plain HTTP from another machine gets a sign-in cookie without
 `Secure`, since the browser would drop one with it.
 
 **A Windows PC as the hub.** `pythonw server\xrnmoni.py --data <DIR>` runs it with no
-console window; it then logs to `<DIR>\xrnmoni.log`. `windows/` starts it at logon.
+console window; it then logs to `<DIR>\xrnmoni.log`. `windows\install.ps1 -WithHub`
+installs it as a logon task beside the agent (section 8 of the
+[Windows guide](windows/README-WINDOWS.md)).
 
 **Deploying to a server.** `server/deploy.sh` installs or updates the hub on a
 server reached over ssh that runs runit (Termux on Android, or any Linux with runit):
@@ -92,8 +105,10 @@ from `server/deploy.local.example`. `server/runit/` has a run file to copy by ha
 instead. Coming from the first (FastAPI) server, copy its `xrnmoni.db` into the data
 folder before the first start: it is brought up to date in place.
 
-**Trying it.** `python3 server/demo_server.py <empty folder>` fills a hub with two
-weeks of a made-up laptop's and PC's days and prints a sign-in.
+**Trying it.** `python3 server/demo_server.py <empty folder> [--port N]` fills a hub with
+two weeks of a made-up laptop's and PC's days, prints the address and a sign-in, and
+keeps posting as the laptop every few seconds so the live view moves (`--no-live` stops
+that). The screenshots in this README come from it. Delete the folder afterwards.
 
 ## The dashboard
 
@@ -107,10 +122,31 @@ weeks of a made-up laptop's and PC's days and prints a sign-in.
 - **Rules**: category rules (an app's name or a site, first match wins, `*` and `?`
   allowed, a site matching its subdomains too), and the week's apps and sites without one.
 - **CSV** of the day or week shown, times in the viewer's time zone.
+- One device or all of them (the picker), colours by app or by category, a light and a
+  dark theme, and a layout that works at phone width. The view, date, device and colouring
+  are in the address, so a link opens the same view.
 
 Days are the viewer's own: the page sends its local midnights. Time counts as active
 when an app or page is in front and the device isn't idle, locked or asleep, so a page
 left open while nobody is there doesn't count.
+
+![The Week view coloured by category: a stacked column per day, the same figures as a table, and the week's apps, sites and categories](docs/screenshots/week.png)
+
+*The week, coloured by category.*
+
+![A detail sheet: the window titles behind one app, with the time in each](docs/screenshots/detail.png)
+
+*Clicking an app opens the window titles behind it; a site opens its pages, a category its
+apps and sites.*
+
+![The Rules page: an ordered list of app and site patterns with their categories, and the week's apps and sites that have none](docs/screenshots/rules.png)
+
+*Category rules, first match wins, with the week's apps and sites that have none below,
+each with a field to give it one.*
+
+<img src="docs/screenshots/phone.png" width="300" alt="The Day view at phone width in the light theme">
+
+*The same day at phone width, light theme.*
 
 ## Security
 
@@ -125,9 +161,8 @@ left open while nobody is there doesn't count.
   websites you visit, other extensions nor other local programs can feed it made-up
   activity. It checks every field and answers 400 to anything malformed. Page addresses
   are kept without their `?query` and `#fragment` unless `keep_url_query = true`.
-- Tests: `pip install -r server/requirements.txt -r agent/requirements.txt`, then
-  `python -m unittest server/test_xrnmoni.py`, `node --test server/test_web.mjs` and
-  `python -m unittest discover tests`.
+- There is no stealth mode: the agent is an ordinary process or service, listed by the
+  system like any other, and the extension shows in the browser's extension list.
 
 ## 2. Agent (on each monitored machine)
 
@@ -212,7 +247,10 @@ token from `python3 server/xrnmoni.py token add <device> --data DIR` on the hub.
 
 The extension reports the active tab's URL/title/time to the agent on
 `127.0.0.1:<bridge_port>` — so the agent must be running on that machine. It
-never holds the server URL or token.
+never holds the server URL or token. It follows tab switches, page loads and window
+focus, and stops the interval when the browser reports the machine idle (60 s) or
+locked. It has no toolbar popup: everything is on its options page (*Port*, *Secret*,
+the extension's *Origin* to copy into `bridge_origins`, and *Last post*).
 
 **Chrome / Edge / Brave**
 
@@ -247,6 +285,35 @@ extension in headless Chromium and checks its posts reach the agent's bridge.
 
 MV3 service workers can be suspended; a 30-second heartbeat chunks long sessions
 so at most ~30s is ever lost on suspension.
+
+## Tests
+
+```bash
+pip install -r server/requirements.txt -r agent/requirements.txt
+python -m unittest server/test_xrnmoni.py     # the hub: API, logins, tokens, rules, retention
+node --test server/test_web.mjs               # the dashboard's local dates, in zones either side of UTC
+python -m unittest discover tests             # agent, spool, tracker, bridge, extension, installers
+```
+
+`tests/test_extension_chromium.py` runs only with Playwright installed. CI
+(`.github/workflows/ci.yml`) runs all three on Ubuntu and Windows, and installs the
+Windows agent end to end on a real Windows runner: every PowerShell script parses under
+Windows PowerShell 5.1; the per-user install and its logon task; the agent's events and
+browser-bridge posts reaching a hub behind a front that strips `/xrnmoni`; stop, start and
+uninstall; and the `xrnmoni-agent.exe` build, installed with `-UseExe` and kept as the
+`xrnmoni-windows` artifact.
+
+## Limits
+
+- Agents exist for Windows and Linux only; there is none for macOS, Android or iOS.
+- On Wayland other than Hyprland (GNOME, KDE), the foreground app is "unknown" (see the
+  platform notes).
+- Web pages are recorded only in browsers with the extension, and only while the agent
+  runs on the same machine. Firefox and Zen give the extension a different origin in each
+  profile, so each needs adding to `bridge_origins`.
+- The hub speaks plain HTTP; TLS comes from a proxy or a private network in front of it.
+- The dashboard reads at most 62 days at a time (400 for the CSV export), and the hub
+  keeps 400 days unless `--retain-days` says otherwise.
 
 ---
 
