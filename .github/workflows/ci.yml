@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   test:
-    # Both, because the agent imports its backend by platform: pywin32 on Windows,
+    # Both, because the agent imports its backend by platform: ctypes Win32 on Windows,
     # python-xlib on Linux. The bridge tests import the agent, so each gets loaded.
     strategy:
       fail-fast: false

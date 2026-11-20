@@ -157,9 +157,10 @@ cp config.example.toml config.toml                # then edit server_url + token
 python agent.py --config config.toml
 ```
 
-Set `server_url` to the hub's LAN IP (e.g. `http://192.168.1.10:8000`), or a URL with
-a path if the server sits behind a proxy (`https://host/xrnmoni`), and `token` to the
-same secret. `device` is the friendly name shown in the dashboard.
+Set `server_url` to the hub's address (e.g. `http://192.168.1.10:5240`), or a URL with
+a path if the hub sits behind a proxy (`https://host/xrnmoni`), and `token` to a device
+token from `python3 server/xrnmoni.py token add <device> --data DIR` on the hub.
+`device` is the friendly name shown in the dashboard.
 
 **What it records, and how it survives trouble**
 
@@ -180,7 +181,9 @@ same secret. `device` is the friendly name shown in the dashboard.
 
 **Platform notes**
 
-- **Windows** — foreground app + idle work out of the box (pywin32).
+- **Windows** — foreground app, idle and the lock screen through the Win32 API (no
+  extra packages). Install with `windows\install.ps1`; see
+  [`windows/README-WINDOWS.md`](windows/README-WINDOWS.md).
 - **Linux / Hyprland (Wayland)** — the focused window comes from Hyprland's event
   socket, so even short switches are seen; auto-detected, also when the agent started
   before Hyprland. Idle comes from the Wayland idle protocol (ext-idle-notify): the
@@ -200,7 +203,7 @@ same secret. `device` is the friendly name shown in the dashboard.
 **Run it on boot**
 
 - Linux: `linux/install.sh`, above.
-- Windows: Task Scheduler → "At log on" → run `pythonw.exe agent.py`.
+- Windows: `windows\install.ps1` sets up a per-user logon task (see [`windows/README-WINDOWS.md`](windows/README-WINDOWS.md)).
 
 ## 3. Browser extension (for live website tracking)
 
