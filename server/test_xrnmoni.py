@@ -4,6 +4,7 @@
 """
 import base64
 import gzip
+import hashlib
 import http.client
 import importlib.util
 import io
@@ -556,6 +557,24 @@ class LoginTest(HubTest):
             for _ in range(10):
                 self.assertEqual(401, self.post([], token=old)[0])
             self.assertEqual(200, self.call("GET", "/api/devices")[0])
+
+    def test_the_same_wrong_password_again_is_refused_without_another_check(self):
+        # Counted once, rightly, the same wrong login still ran bcrypt every time it came: one
+        # address sending it over and over kept the server's CPU busy and never met the limit.
+        import bcrypt
+
+        header = basic("alex", "wrong-again")
+        with unittest.mock.patch.object(bcrypt, "checkpw", wraps=bcrypt.checkpw) as checkpw:
+            for _ in range(20):
+                self.assertEqual(401, self.call("GET", "/api/devices", auth=header)[0])
+        self.assertEqual(1, checkpw.call_count)
+        self.assertEqual(200, self.call("GET", "/api/devices")[0])   # counted once: not locked out
+        remembered = repr(self.app.login.failures)
+        for kept in (header, header[6:], "wrong-again", hashlib.sha256(header.encode()).hexdigest()):
+            self.assertNotIn(kept, remembered)
+        # A changed users file (here that very password) is worth checking again.
+        srv.write_private(self.users, "alex:" + bcrypt.hashpw(b"wrong-again", bcrypt.gensalt(4)).decode() + "\n")
+        self.assertEqual(200, self.call("GET", "/api/devices", auth=header)[0])
 
     def test_a_right_login_clears_only_its_own_names_mistakes(self):
         addr = "203.0.113.80"

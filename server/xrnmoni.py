@@ -879,8 +879,10 @@ class Login:
         self.cache = {}  # sha256(user:secret) -> (user, expires, users-file mtime)
         self.fail_lock = threading.Lock()
         self.fail_settled = threading.Condition(self.fail_lock)
-        # client address -> {sha256 of a wrong Authorization: (monotonic time it last came, user name)}
+        # client address -> {fail_id of a wrong Authorization: (monotonic time it last came, user
+        # name, users_stamp when it was found wrong)}
         self.failures = {}
+        self.fail_key = secrets.token_bytes(32)  # this process's only: no password can be looked up
         self.checking = {}  # client address -> how many of its logins are being checked right now
         self.held = threading.BoundedSemaphore(MAX_HELD)
 
@@ -889,6 +891,27 @@ class Login:
             return os.stat(self.users_path).st_mtime
         except OSError:
             return 0
+
+    def users_stamp(self):
+        """Which version of the users file this is: a password found wrong in one is wrong until
+        it changes. None if it can't be read."""
+        try:
+            st = os.stat(self.users_path)
+        except OSError:
+            return None
+        return st.st_ino, st.st_mtime_ns, st.st_size
+
+    def fail_id(self, header):
+        """What a wrong login is remembered by: keyed, so neither it nor a hash anyone could try
+        passwords against is kept."""
+        return hmac.new(self.fail_key, header.encode(), hashlib.sha256).hexdigest()
+
+    def known_wrong(self, addr, header, stamp):
+        """Whether this address sent this very login within FAIL_WINDOW_S, it was wrong, and the
+        users file hasn't changed since: then it is wrong again, and bcrypt needn't say so."""
+        with self.fail_lock:
+            f = self.failures.get(addr, {}).get(self.fail_id(header))
+            return bool(f and stamp is not None and f[2] == stamp and time.monotonic() - f[0] < FAIL_WINDOW_S)
 
     def cached_basic(self, header):
         """The user name for a password already found right (the auth cache), else None: no check."""
@@ -1014,7 +1037,7 @@ class Login:
         at once can't all pass the limit while the first are still in bcrypt; one that finds no
         place waits rather than being turned away. A wrong login sent again needs no place: it is
         counted already."""
-        key = hashlib.sha256(header.encode()).hexdigest()
+        key = self.fail_id(header)
         with self.fail_settled:
             now = time.monotonic()
             if len(self.failures) > 10000:  # a flood from many addresses: forget the stale ones
@@ -1030,12 +1053,14 @@ class Login:
                     return True
                 self.fail_settled.wait(1)
 
-    def settle_guess(self, addr, header, right):
+    def settle_guess(self, addr, header, right, stamp=None):
         """A login reserve_guess let through has been checked. A wrong one counts against the
         address, and the same one again counts once: that's an agent still sending a revoked token
         or a browser an old password, every few seconds, not someone guessing, and counting each
-        would lock the owner out of the dashboard on the same machine. A right one clears that
-        name's mistakes from this address, no one else's. None settles nothing."""
+        would lock the owner out of the dashboard on the same machine. It is remembered with the
+        users file's [stamp], so it isn't checked again while that stays the same (known_wrong). A
+        right one clears that name's mistakes from this address, no one else's. None settles
+        nothing."""
         name = (basic_login(header)[0] or "")[:64]
         with self.fail_settled:
             left = self.checking.get(addr, 1) - 1
@@ -1044,7 +1069,7 @@ class Login:
             else:
                 self.checking.pop(addr, None)
             if right is False:
-                self.failures.setdefault(addr, {})[hashlib.sha256(header.encode()).hexdigest()] = (time.monotonic(), name)
+                self.failures.setdefault(addr, {})[self.fail_id(header)] = (time.monotonic(), name, stamp)
             elif right:
                 kept = {k: f for k, f in self.failures.get(addr, {}).items() if f[1] != name}
                 if kept:
@@ -1315,16 +1340,20 @@ class Handler(BaseHTTPRequestHandler):
             self.send(429, "too many wrong passwords; try again later",
                       headers={"Retry-After": str(FAIL_WINDOW_S)})
             return None
-        user, right = None, None
+        user, right, stamp = None, None, None
         if header:
             try:
                 # A password already found right is a session, not a login, and settles nothing.
                 user = login.cached_basic(header)
                 if not user:
-                    user = login.check_basic(header)
-                    right = bool(user)
+                    stamp = login.users_stamp()
+                    if login.known_wrong(addr, header, stamp):
+                        right = False  # sent again and again, it would cost a bcrypt check each time
+                    else:
+                        user = login.check_basic(header)
+                        right = bool(user)
             finally:
-                login.settle_guess(addr, header, right)
+                login.settle_guess(addr, header, right, stamp)
         if not user:
             if header:
                 login.hold_wrong_login()
