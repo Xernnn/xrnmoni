@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "xrnmoni web tracker",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Reports active-tab page intervals to the local xrnmoni agent (127.0.0.1).",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3IZMAZMQtTxwr3SQ/1fK77L5ItkbhXkOFNPuP0z3e+SxkaRlNsbaAbscY4PTgpY/h8TIiuighghIc80tBuOi8W8webiYqFvqeo4C+06TOaNlGVM/8lbiYXwZl06MLQpetSEAmvC/EXAFnEwAQD949G2oYd7yR7Pjth/RH0cNMacqmIPsS2B1NzIttamb7BOidhLOP8V7YLk9UoPz/4pszYrWRP64zHWgFf5QvToekcn5wR9Jtaztqgk0YSTdDQHZ7WCLvusBe4W5Xsquqjf63amQgiOW+3WhyYIjtXfBJreo3eNDE12jugQddBHURDhBtqS4QFpBRzEnvqBTJw0JOQIDAQAB",
   "permissions": ["tabs", "idle", "alarms", "storage"],
