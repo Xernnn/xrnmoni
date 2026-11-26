@@ -1,0 +1,27 @@
+# Gradle / Kotlin build output and caches
+.gradle/
+build/
+.kotlin/
+captures/
+
+# Machine-specific: the Android SDK location and the hub's address (xrnmoni.hub)
+local.properties
+
+# Built apps and signing keys
+*.apk
+*.aab
+*.jks
+*.keystore
+
+# Secrets, logs, heap dumps
+.env
+.env.*
+*.log
+*.hprof
+
+# IDE / editor / OS
+.idea/
+*.iml
+.vscode/
+*.swp
+.DS_Store
