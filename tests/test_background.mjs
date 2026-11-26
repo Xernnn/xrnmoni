@@ -22,7 +22,9 @@ async function load(tab) {
   const events = {
     onActivated: listener(), onUpdated: listener(), onFocusChanged: listener(),
     onStateChanged: listener(), onStartup: listener(), onInstalled: listener(), onAlarm: listener(),
+    onClicked: listener(),
   };
+  const opened = [];
   const chrome = {
     tabs: {
       onActivated: events.onActivated, onUpdated: events.onUpdated,
@@ -30,7 +32,8 @@ async function load(tab) {
     },
     windows: { onFocusChanged: events.onFocusChanged, getLastFocused: async () => ({ focused: true }) },
     idle: { setDetectionInterval() {}, onStateChanged: events.onStateChanged },
-    runtime: { onStartup: events.onStartup, onInstalled: events.onInstalled },
+    runtime: { onStartup: events.onStartup, onInstalled: events.onInstalled, openOptionsPage: () => opened.push("options") },
+    action: { onClicked: events.onClicked },
     alarms: { create() {}, onAlarm: events.onAlarm },
     storage: {
       session: { get: async () => ({ ...session }), set: async (o) => Object.assign(session, o) },
@@ -49,7 +52,7 @@ async function load(tab) {
   vm.runInNewContext(SOURCE, context);
   await settle();
   return {
-    posts, events, state,
+    posts, events, state, opened,
     advance(seconds) { clock += seconds * 1000; },
   };
 }
@@ -96,4 +99,11 @@ test("moving from an ordinary tab to a private one ends the ordinary page there"
   await ext.events.onStateChanged.fire("idle");
   assert.deepEqual(ext.posts.map((p) => [p.body.title, p.body.url, p.body.duration]),
     [["Today", "https://news.example.com/today", 10], ["Private", null, 5]]);
+});
+
+test("the toolbar button opens the options", async () => {
+  const ext = await load(null);
+  await ext.events.onClicked.fire({});
+  assert.deepEqual(ext.opened, ["options"]);
+  assert.equal(ext.posts.length, 0);
 });

@@ -131,6 +131,9 @@ chrome.idle.onStateChanged.addListener(async (state) => {
   else await stop(now());   // idle or locked
 });
 
+// The toolbar button shows the extension is there; a click opens its options.
+chrome.action.onClicked.addListener(() => chrome.runtime.openOptionsPage());
+
 chrome.runtime.onStartup.addListener(reeval);
 chrome.runtime.onInstalled.addListener(reeval);
 

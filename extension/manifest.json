@@ -6,11 +6,10 @@
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3IZMAZMQtTxwr3SQ/1fK77L5ItkbhXkOFNPuP0z3e+SxkaRlNsbaAbscY4PTgpY/h8TIiuighghIc80tBuOi8W8webiYqFvqeo4C+06TOaNlGVM/8lbiYXwZl06MLQpetSEAmvC/EXAFnEwAQD949G2oYd7yR7Pjth/RH0cNMacqmIPsS2B1NzIttamb7BOidhLOP8V7YLk9UoPz/4pszYrWRP64zHWgFf5QvToekcn5wR9Jtaztqgk0YSTdDQHZ7WCLvusBe4W5Xsquqjf63amQgiOW+3WhyYIjtXfBJreo3eNDE12jugQddBHURDhBtqS4QFpBRzEnvqBTJw0JOQIDAQAB",
   "permissions": ["tabs", "idle", "alarms", "storage"],
   "host_permissions": ["http://127.0.0.1/*"],
-  "icons": {
-    "16": "icons/icon16.png",
-    "32": "icons/icon32.png",
-    "48": "icons/icon48.png",
-    "128": "icons/icon128.png"
+  "icons": { "16": "icons/icon16.png", "24": "icons/icon24.png", "32": "icons/icon32.png", "48": "icons/icon48.png", "64": "icons/icon64.png", "96": "icons/icon96.png", "128": "icons/icon128.png", "256": "icons/icon256.png" },
+  "action": {
+    "default_title": "xrnmoni",
+    "default_icon": { "16": "icons/icon16.png", "24": "icons/icon24.png", "32": "icons/icon32.png", "48": "icons/icon48.png", "64": "icons/icon64.png", "96": "icons/icon96.png", "128": "icons/icon128.png", "256": "icons/icon256.png" }
   },
   "options_ui": {
     "page": "options.html",
