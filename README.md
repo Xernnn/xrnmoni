@@ -37,7 +37,7 @@ stretch was, click to open it), and the day's apps, sites and categories.*
 | `extension/`  | MV3 browser extension for live page tracking (Chromium and Firefox/Zen) |
 | `linux/`      | `install.sh` and the systemd user unit for the Linux agent |
 | `windows/`    | Per-user Windows installer, start/stop/status scripts, the `.exe` build, and its guide |
-| `scripts/`    | `package-extension.py` (the `.zip` and `.xpi`) |
+| `scripts/`    | `package-extension.py` (the `.zip` and `.xpi`), `bundle-linux.py` (the Linux agent as one `.tar.gz`) |
 | `tests/`      | Agent, bridge, extension and installer tests (the hub's own are in `server/`) |
 
 ---
