@@ -58,6 +58,11 @@ fun hubAddress(text: String, local: Boolean): String? {
 
 private val LOCAL_HOSTS = setOf("127.0.0.1", "localhost", "10.0.2.2")
 
+/** Whether [text] is shaped like a device token the hub makes (`xrnmoni_<8 hex>_<43 characters>`). */
+fun isDeviceToken(text: String): Boolean = DEVICE_TOKEN.matches(text)
+
+private val DEVICE_TOKEN = Regex("xrnmoni_[0-9a-f]{8}_[A-Za-z0-9_-]{43}")
+
 /**
  * Sends the outbox to the hub, oldest first, in batches of [BATCH], as the desktop agent's Sender
  * does (agent/agent.py): a 2xx with `{"ok": true}` takes the batch out (events the hub lists as

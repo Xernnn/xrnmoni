@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The xrnmoni tile (xrnhub web/apps/xrnmoni.svg): signal teal, the family's hand-drawn x, a screen on a stand. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="100"
+    android:viewportHeight="100">
+    <group>
+        <clip-path android:pathData="M24,0 H76 A24,24 0 0 1 100,24 V76 A24,24 0 0 1 76,100 H24 A24,24 0 0 1 0,76 V24 A24,24 0 0 1 24,0 Z" />
+        <path android:pathData="M0,0 H100 V100 H0 Z" android:fillColor="#039B7D" />
+        <group android:pivotX="110" android:pivotY="118"
+            android:scaleX="0.6" android:scaleY="0.6"
+            android:translateX="-60" android:translateY="-68">
+            <path
+                android:pathData="M-40,174 L55,72 C68,58 85,47 98,50 C110,53 112,72 113,95 C114,125 115,150 118,165 C121,182 135,190 150,186 C158,184 163,178 166,170 M-60,301.3 L260,-64.9"
+                android:strokeColor="#18181B"
+                android:strokeWidth="28.33"
+                android:strokeLineCap="round"
+                android:strokeLineJoin="round" />
+        </group>
+    </group>
+    <group android:translateX="-2.5" android:translateY="-2.5"
+        android:scaleX="1.05" android:scaleY="1.05">
+        <path android:pathData="M28,24 H72 A8,8 0 0 1 80,32 V56 A8,8 0 0 1 72,64 H28 A8,8 0 0 1 20,56 V32 A8,8 0 0 1 28,24 Z" android:fillColor="#FFFFFF" />
+        <path android:pathData="M45,62 H55 V70 H63 A3.5,3.5 0 0 1 63,77 H37 A3.5,3.5 0 0 1 37,70 H45 Z" android:fillColor="#FFFFFF" />
+        <path
+            android:pathData="M28,45 H37 L42,35 L50,54 L56,41 L59,45 H72"
+            android:strokeColor="#039B7D"
+            android:strokeWidth="5.5"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round" />
+    </group>
+</vector>

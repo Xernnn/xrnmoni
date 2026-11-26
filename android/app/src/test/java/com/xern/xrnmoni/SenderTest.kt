@@ -7,6 +7,7 @@ import com.xern.xrnmoni.data.Post
 import com.xern.xrnmoni.data.Sender
 import com.xern.xrnmoni.data.Sent
 import com.xern.xrnmoni.data.hubAddress
+import com.xern.xrnmoni.data.isDeviceToken
 import com.xern.xrnmoni.domain.Event
 import java.io.File
 import java.net.InetSocketAddress
@@ -20,7 +21,9 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 
@@ -174,5 +177,13 @@ class SenderTest {
         assertNull(hubAddress("https://alex:secret@hub.example.org/xrnmoni", local = false))
         assertNull(hubAddress("hub.example.org/xrnmoni", local = false))
         assertNull(hubAddress("", local = false))
+    }
+
+    @Test fun onlyATokenShapedLikeTheHubsIsTaken() {
+        assertTrue(isDeviceToken(token))
+        assertFalse(isDeviceToken("xrnmoni_0123ABCD_" + "A".repeat(43)))
+        assertFalse(isDeviceToken("xrnmoni_0123abcd_" + "A".repeat(42)))
+        assertFalse(isDeviceToken("xrndev_0123abcd_" + "A".repeat(43)))
+        assertFalse(isDeviceToken(" $token"))
     }
 }
