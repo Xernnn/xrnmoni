@@ -13,11 +13,13 @@
 #     XRNMONI_PORT     the port on 127.0.0.1 (5240)
 #     XRNMONI_PREFIX   the path a reverse proxy publishes it under (/xrnmoni)
 #     XRNMONI_USERS    a users file to sign in with, such as one other services share
-#                      (default: DIR/data/users; make it with `user add`)
+#                      (default: DIR/data/users; make it with `user add`); ~/ is the server's home
 #     XRNMONI_VIEWERS  more users in it who may see the dashboard, space-separated
 #     XRNMONI_SERVICE  the runit service's name (xrnmoni)
 #     XRNMONI_SVDIR    runit's service folder (default: Termux's, $PREFIX/var/service)
 #     XRNMONI_GUARD    a command the run file runs first; the service doesn't start if it fails
+#     XRNMONI_SVGUARD  a guard on the server that takes the port and the program, run first the
+#                      same way (the home server's sv-guard: ~/.local/bin/sv-guard)
 #     XRNMONI_PUBLISH  a command run on the server at the end, to publish it through a proxy
 set -eu
 
@@ -35,7 +37,13 @@ VIEWERS=${XRNMONI_VIEWERS:-}
 SERVICE=${XRNMONI_SERVICE:-xrnmoni}
 SVDIR_SET=${XRNMONI_SVDIR:-}
 GUARD=${XRNMONI_GUARD:-}
+SVGUARD=${XRNMONI_SVGUARD:-}
 PUBLISH=${XRNMONI_PUBLISH:-}
+
+# Paths on the server. An unquoted ~/ in deploy.local was turned into this machine's home when the
+# shell read it here; the server's home is another folder.
+case $USERS in "$HOME"/*) USERS="~/${USERS#"$HOME"/}" ;; esac
+case $SVGUARD in "$HOME"/*) SVGUARD="~/${SVGUARD#"$HOME"/}" ;; esac
 
 if [ -z "$HOST" ]; then
     echo "Which server? Give its ssh host: server/deploy.sh HOST, or set XRNMONI_HOST in server/deploy.local." >&2
@@ -62,8 +70,8 @@ tar czf - --exclude=__pycache__ -C "$HERE" xrnmoni.py web | ssh "$HOST" "sh -c $
     set -e
     D=$1
     case $D in /*) ;; *) D=$HOME/$D ;; esac
-    mkdir -p "$D/data"
-    chmod 700 "$D" "$D/data"
+    mkdir -p "$D/data/downloads"
+    chmod 700 "$D" "$D/data" "$D/data/downloads"
     cd "$D"
     rm -rf .incoming web.old
     mkdir .incoming
@@ -78,11 +86,16 @@ tar czf - --exclude=__pycache__ -C "$HERE" xrnmoni.py web | ssh "$HOST" "sh -c $
 ') sh $(q "$DIR")"
 
 echo "Setting up the service..."
-ssh "$HOST" "sh -s -- $(q "$DIR") $(q "$PORT") $(q "$PREFIX_PATH") $(q "$USERS") $(q "$VIEWERS") $(q "$SERVICE") $(q "$SVDIR_SET") $(q "$GUARD")" <<'EOS'
+ssh "$HOST" "sh -s -- $(q "$DIR") $(q "$PORT") $(q "$PREFIX_PATH") $(q "$USERS") $(q "$VIEWERS") $(q "$SERVICE") $(q "$SVDIR_SET") $(q "$GUARD") $(q "$SVGUARD")" <<'EOS'
 set -e
-DIR=$1 PORT=$2 PREFIX_PATH=$3 USERS=$4 VIEWERS=$5 SERVICE=$6 SV=$7 GUARD=$8
+DIR=$1 PORT=$2 PREFIX_PATH=$3 USERS=$4 VIEWERS=$5 SERVICE=$6 SV=$7 GUARD=$8 SVGUARD=$9
 case $DIR in /*) ;; *) DIR=$HOME/$DIR ;; esac
 case $USERS in "~/"*) USERS=$HOME/${USERS#"~/"} ;; esac
+case $SVGUARD in "~/"*) SVGUARD=$HOME/${SVGUARD#"~/"} ;; esac
+if [ -n "$SVGUARD" ] && [ ! -x "$SVGUARD" ]; then
+    echo "No $SVGUARD on the server; put it there first (the home-server repo's phone/install-sv-guard)." >&2
+    exit 1
+fi
 S=${SV:-${PREFIX:-}/var/service}
 if [ ! -d "$S" ]; then
     echo "No runit service folder at $S; set XRNMONI_SVDIR." >&2
@@ -109,6 +122,7 @@ write_run() {
         echo "#!$SH"
         echo "# The xrnmoni hub, written by server/deploy.sh from its settings: change them there."
         if [ -n "$GUARD" ]; then echo "$GUARD || exit 1"; fi
+        if [ -n "$SVGUARD" ]; then echo "\"$SVGUARD\" $PORT \"$DIR/xrnmoni.py\" || exit 1"; fi
         echo "exec \"$PY\" \"$DIR/xrnmoni.py\" $ARGS 2>&1"
     } > "$1/run.new"
     chmod 755 "$1/run.new"

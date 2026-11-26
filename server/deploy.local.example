@@ -11,13 +11,17 @@ XRNMONI_PORT=5240
 XRNMONI_PREFIX=/xrnmoni
 
 # Sign in with a users file other services already share (htpasswd, bcrypt), instead of
-# xrnmoni/data/users; the first user in it sees the dashboard, plus any named here.
-#XRNMONI_USERS=~/.config/myservices/users
+# xrnmoni/data/users; the first user in it sees the dashboard and manages devices, plus any
+# viewers named here. ~/ is the server's home (quote it).
+#XRNMONI_USERS='~/.config/myservices/users'
 #XRNMONI_VIEWERS="partner"
 
 # runit's service folder, if not Termux's $PREFIX/var/service.
 #XRNMONI_SVDIR=/etc/service
 
-# A check the run file makes before starting, and a command that publishes the hub afterwards.
+# A check the run file makes before starting; a guard that takes the port and the program (one
+# that stops a copy left running after its supervisor died); and a command that publishes the hub
+# afterwards.
 #XRNMONI_GUARD='$HOME/bin/port-free 5240'
+#XRNMONI_SVGUARD='~/.local/bin/sv-guard'
 #XRNMONI_PUBLISH='tailscale funnel --bg --set-path /xrnmoni http://127.0.0.1:5240'

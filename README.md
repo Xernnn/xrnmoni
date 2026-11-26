@@ -103,8 +103,12 @@ server reached over ssh that runs runit (Termux on Android, or any Linux with ru
 it tests, copies `xrnmoni.py` and `web/` together, writes the run file, restarts the
 service and waits for `/health`. Its settings (host, folder, port, users file, a
 publish command for the proxy) go in `server/deploy.local`, which git ignores; start
-from `server/deploy.local.example`. `server/runit/` has a run file to copy by hand
-instead. Coming from the first (FastAPI) server, copy its `xrnmoni.db` into the data
+from `server/deploy.local.example`. A `~/` in it is the server's home, even unquoted.
+`XRNMONI_SVGUARD` names a guard on the server that the run file calls with the port and
+the program first (one that stops a copy left running after its supervisor died).
+`server/put-downloads.sh FILE...` puts the installers in the hub's `data/downloads/`
+for the Get page (each file whole or not at all; the page offers the newest of each
+kind). `server/runit/` has a run file to copy by hand instead. Coming from the first (FastAPI) server, copy its `xrnmoni.db` into the data
 folder before the first start: it is brought up to date in place.
 
 **Trying it.** `python3 server/demo_server.py <empty folder> [--port N]` fills a hub with
