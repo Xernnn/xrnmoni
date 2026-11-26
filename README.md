@@ -34,11 +34,60 @@ stretch was, click to open it), and the day's apps, sites and categories.*
 |---------------|-------------------------------------------------------|
 | `server/`     | The hub: `xrnmoni.py` (ingest + query API, SQLite store), the dashboard in `web/`, `deploy.sh`, `demo_server.py` |
 | `agent/`      | Cross-platform agent (Windows + Linux): `agent.py`, `platform_linux.py`, `platform_win.py` |
+| `android/`    | The Android agent (Kotlin, Compose): the phone's app use from its usage history, posted like the desktop agent's |
 | `extension/`  | MV3 browser extension for live page tracking (Chromium and Firefox/Zen) |
 | `linux/`      | `install.sh` and the systemd user unit for the Linux agent |
 | `windows/`    | Per-user Windows installer, start/stop/status scripts, the `.exe` build, and its guide |
 | `scripts/`    | `package-extension.py` (the `.zip` and `.xpi`), `bundle-linux.py` (the Linux agent as one `.tar.gz`) |
 | `tests/`      | Agent, bridge, extension and installer tests (the hub's own are in `server/`) |
+
+## Setting up a child's devices
+
+xrnmoni runs in the open on them: a notification on the phone, a toolbar button in the
+browser, a listed task or service on the laptop. Nothing hides it or stops its removal.
+
+**Once:** the hub is deployed (section 1) and its downloads folder holds the release's
+files (`server/put-downloads.sh FILE...`).
+
+**For each device:**
+
+1. On your own device, sign in to the dashboard: **Devices**, type a name (`sam-laptop`),
+   **Add**, **Copy** the token. It is shown once.
+2. On the child's device, open `<hub>/get`, paste the token, **Show**. The page lists each
+   download with its SHA-256, and the **Hub** address to paste below. Your password is
+   never typed there.
+
+**Windows laptop** (signed in as the child)
+
+3. Download **Windows**, unzip it, double-click `windows\install.bat`, and answer with the
+   hub address, the token and the device name. SmartScreen: **More info**, **Run anyway**.
+4. Edge or Chrome: `edge://extensions`, **Developer mode**, **Load unpacked**,
+   `%LOCALAPPDATA%\xrnmoni\extension`; **Details**: **Allow in InPrivate**; **Extension
+   options**: paste the secret the installer printed, **Save**.
+5. Within a minute the device shows on the dashboard; the extension's **Last post** says 200.
+
+**Linux laptop** (signed in as the child)
+
+3. Download **Linux**, unpack it where it can stay, and run
+   `linux/install.sh --hub <hub> --token <token> --device <name>` in it.
+4. Chromium or Chrome: `chrome://extensions`, **Developer mode**, **Load unpacked**, the
+   bundle's `extension` folder; **Details**: **Allow in Incognito**; options: paste the
+   secret install.sh printed, **Save**.
+5. Check as for Windows. The app in front is seen on Hyprland and X11 sessions only
+   (GNOME and KDE on Wayland show it as "unknown").
+
+**Android phone** (Android 9 or later)
+
+3. Download **Android**, let the browser install apps when it asks, install.
+4. Open xrnmoni: **Hub**, **Token**, **Save**. Then each row: **Usage access** (turn
+   xrnmoni on), **Notifications**, **Battery** (unrestricted), and on Xiaomi **Autostart**.
+5. **Last post** shows a time and 200, and the phone shows on the dashboard. The
+   "Recording" notification stays while it runs.
+
+Firefox only takes an unsigned extension in its ESR, Developer and Nightly builds
+(`xpinstall.signatures.required` off, then the **Firefox** `.xpi`). Private windows and
+tabs are recorded as time under "Private", never their pages. To stop monitoring a device,
+**Revoke** its token under **Devices**, then uninstall it there.
 
 ---
 
@@ -301,9 +350,22 @@ so at most ~30s is ever lost on suspension.
 ```bash
 pip install -r server/requirements.txt -r agent/requirements.txt
 python -m unittest server/test_xrnmoni.py     # the hub: API, logins, tokens, rules, retention
-node --test server/test_web.mjs               # the dashboard's local dates, in zones either side of UTC
+python -m unittest server/test_deploy.py      # deploy.sh and put-downloads.sh against a made-up server
+node --test server/test_web.mjs tests/*.mjs   # dashboard dates; the extension's posts and icons
 python -m unittest discover tests             # agent, spool, tracker, bridge, extension, installers
+cd android && ./gradlew :app:testDebugUnitTest  # the phone: usage history to events, outbox, sender
 ```
+
+**Android** (`android/`, minSdk 28): `./gradlew :app:assembleDebug` builds a debug APK.
+A release, `./gradlew :app:assembleRelease`, is signed with the key that
+`xrn-signing.properties` beside the repo's folder names, so it is built from the main
+checkout; elsewhere it comes out unsigned. `xrnmoni.hub=<address>` in the git-ignored
+`android/local.properties` fills the Hub field in. Text is MiSans Latin by Xiaomi
+(https://hyperos.mi.com/font), unmodified.
+
+**Releases:** a `v*` tag runs `.github/workflows/release.yml`: the tests, then a draft
+release with the Windows package, the Linux bundle and the extension's `.zip` and `.xpi`.
+The signed APK is added to it by hand before it is published.
 
 `tests/test_extension_chromium.py` runs only with Playwright installed. CI
 (`.github/workflows/ci.yml`) runs all three on Ubuntu and Windows, and installs the
@@ -315,7 +377,8 @@ uninstall; and the `xrnmoni-agent.exe` build, installed with `-UseExe` and kept 
 
 ## Limits
 
-- Agents exist for Windows and Linux only; there is none for macOS, Android or iOS.
+- Agents exist for Windows, Linux and Android; there is none for macOS or iOS. The phone
+  records apps, the lock screen and the screen being off, not web pages or titles.
 - On Wayland other than Hyprland (GNOME, KDE), the foreground app is "unknown" (see the
   platform notes).
 - Web pages are recorded only in browsers with the extension, and only while the agent

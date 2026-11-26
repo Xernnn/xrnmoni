@@ -9,6 +9,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -53,7 +54,8 @@ def read(path):
         return f.read()
 
 
-@unittest.skipUnless(shutil.which("sh") and shutil.which("tar") and PYTHON3, "needs sh, tar and python3")
+@unittest.skipUnless(sys.platform != "win32" and shutil.which("sh") and shutil.which("tar") and PYTHON3,
+                     "needs sh, tar and python3, not Windows")
 class Deploy(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="xrnmoni-deploy-")

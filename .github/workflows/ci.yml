@@ -35,8 +35,12 @@ jobs:
       - name: Server tests
         run: python -m unittest server/test_xrnmoni.py
 
-      - name: Dashboard date tests
-        run: node --test server/test_web.mjs
+      - name: deploy.sh and put-downloads.sh against a made-up server
+        if: runner.os == 'Linux'
+        run: python -m unittest server/test_deploy.py
+
+      - name: Dashboard date tests, the extension's posts and icons
+        run: node --test server/test_web.mjs tests/test_background.mjs tests/test_icons.mjs
 
       - name: Tests
         run: python -m unittest discover tests

@@ -17,7 +17,9 @@ main [README](../README.md)).
   `python3 server/xrnmoni.py token add den-pc --data <hub data folder>` prints one.
   It belongs to that device name, so use the same name below.
 - **The hub's address**, with its path if it has one: `https://hub.example.net/xrnmoni`.
-- **The files**, either of:
+- **The files**, any of:
+  - the **Windows** download on the hub's Get page (`<hub>/get`, opened with the device
+    token), or the `xrnmoni-windows-<version>.zip` of a release: the package below;
   - this repository's folder (the installer finds Python 3.10+, or installs it for the
     user with winget), or
   - the **`xrnmoni-windows`** package, from the Artifacts of a CI run (Actions, the latest
