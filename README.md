@@ -65,6 +65,9 @@ files (`server/put-downloads.sh FILE...`).
    `%LOCALAPPDATA%\xrnmoni\extension`; **Details**: **Allow in InPrivate**; **Extension
    options**: paste the secret the installer printed, **Save**.
 5. Within a minute the device shows on the dashboard; the extension's **Last post** says 200.
+6. To close private windows: sign in as an administrator, open PowerShell with **Run as
+   administrator**, and run `powershell -ExecutionPolicy Bypass -File windows\admin\private-windows.ps1`
+   (Chrome, Edge, Brave; `-Undo` reverses it). The child's own account should be a standard one.
 
 **Linux laptop** (signed in as the child)
 

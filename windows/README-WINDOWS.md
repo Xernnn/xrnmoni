@@ -116,6 +116,21 @@ Then in `about:addons`, xrnmoni: **Run in Private Windows: Allow**, and its **Op
 paste the secret, **Save**, and copy the **Origin** (`moz-extension://...`, different in
 every Firefox profile) into `windows\install.bat -BridgeOrigin moz-extension://...`.
 
+## 3a. Private windows off (a child's PC)
+
+A private window is where xrnmoni records only "Private" and its time. On a child's PC you can
+close them in every Chromium browser at once, for every account, as machine policy that a
+standard (not administrator) account can't change. In an **administrator** PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File windows\admin\private-windows.ps1
+```
+
+It turns off Chrome's and Chromium's Incognito, Edge's InPrivate, and Brave's private and Tor
+windows; each browser takes it at its next start, and `chrome://policy` (`edge://policy`)
+lists it. `-Status` shows each value, `-Undo` allows them again. Give the child a standard
+account, or they can undo it.
+
 ## 4. Every day
 
 Nothing to do. `windows\status.bat` shows whether it runs and reaches the hub.
