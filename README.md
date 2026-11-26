@@ -202,6 +202,10 @@ token from `python3 server/xrnmoni.py token add <device> --data DIR` on the hub.
 - The foreground window (`app`), idle time (`idle`: no input for `afk_threshold`
   seconds), the locked screen (`locked`) and sleep (`sleep`). One at a time: sleep
   beats locked, locked beats idle, idle beats the window.
+- A private browser window (its title says Private Browsing, Incognito, InPrivate or
+  (Private)) is kept as its app and its time with the title `Private`, never the page.
+  The extension does the same for a private window's tabs when it is allowed in them:
+  their time counts under the site `Private`, with no address or title.
 - Intervals are sent as closed chunks of at most 60 s while they last, and split at
   local midnight, so a long stay shows up within a minute and day totals add up.
 - Every event goes into a SQLite spool (`spool_path`, default

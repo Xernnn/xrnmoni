@@ -82,6 +82,36 @@ class TrackerTest(unittest.TestCase):
         self.assertTrue(all(b - a <= 60 for _, a, b in self.spans()))
 
 
+class PrivateWindowTest(TrackerTest):
+    TITLES = [
+        ("firefox", "Bank login \u2014 Mozilla Firefox Private Browsing"),
+        ("zen", "Chat \u2014 Zen Private Browsing"),
+        ("chromium", "Search results - Chromium (Incognito)"),
+        ("msedge", "Video and 2 more pages - [InPrivate] - Microsoft Edge"),
+        ("brave-browser", "Shop - Brave (Private)"),
+    ]
+
+    def test_a_private_window_keeps_its_app_and_time_but_not_its_title(self):
+        for app, title in self.TITLES:
+            self.backend.window = (app, title)
+            self.run_for(10)
+        self.backend.window = ("editor", "notes")
+        self.run_for(4)
+        self.tracker.close()
+        got = [(e["app"], e["title"], e["ts_end"] - e["ts_start"]) for e in self.events]
+        self.assertEqual(got[:5], [(app, "Private", 10) for app, _ in self.TITLES])
+        self.assertEqual(got[5][:2], ("editor", "notes"))
+        for e in self.events:
+            for _, title in self.TITLES:
+                self.assertNotIn(title.split(" ")[0], e["title"])
+
+    def test_an_ordinary_browser_window_keeps_its_title(self):
+        self.backend.window = ("firefox", "Recipes \u2014 Mozilla Firefox")
+        self.run_for(4)
+        self.tracker.close()
+        self.assertEqual(self.events[0]["title"], "Recipes \u2014 Mozilla Firefox")
+
+
 class GapTest(TrackerTest):
     """The loop wakes after more wall time than it slept: suspend, or a stopped process."""
 

@@ -85,6 +85,7 @@ EVENT_ID = re.compile(r"[0-9a-f]{32}")
 EVENT_TYPE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 LEGACY_TYPES = {"browser": "web", "afk": "idle"}  # what the first agent called them
 AWAY = ("sleep", "locked", "idle")  # time nobody was at the device, strongest first
+PRIVATE = "Private"  # what agents send for a private window's title and a private tab's page
 DEVICE_NAME = re.compile(r"[^\x00-\x1f\x7f]{1,64}")
 MERGE_GAP_S = 5  # pieces of the same thing this close are one stretch on the timeline
 TOP = 50
@@ -495,7 +496,9 @@ class Day:
             if kind == "app":
                 apps.append((s, e, (app or "?", title or "")))
             elif kind == "web":
-                webs.append((s, e, (domain or "?", title or "", url or "")))
+                # A private tab comes with no address: its time is the site "Private".
+                site = domain or (PRIVATE if title == PRIVATE and not url else "?")
+                webs.append((s, e, (site, title or "", url or "")))
             elif kind in AWAY:
                 aways.append((s, e, kind))
             else:

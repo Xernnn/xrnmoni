@@ -91,6 +91,18 @@ def boot_event(device, boot_time, boot_id=None):
 
 DEVICE_NAME = re.compile(r"[^\x00-\x1f\x7f]{1,64}")
 
+PRIVATE = "Private"
+# What browsers put in a private window's title: Firefox and Zen "... Private Browsing", Chromium
+# "(Incognito)", Edge "InPrivate", Brave "(Private)". Such a window is recorded as its app and its
+# time with PRIVATE for the title, never the page it shows. A page that merely mentions one of these
+# loses its title too, which errs the right way.
+PRIVATE_TITLE = re.compile(r"private browsing|incognito|inprivate|\(private\)", re.IGNORECASE)
+
+
+def private_title(title):
+    """The title to keep for a window: PRIVATE for a private browser window, else the title."""
+    return PRIVATE if title and PRIVATE_TITLE.search(title) else title
+
 
 def default_spool_path(platform=sys.platform, env=os.environ, home=os.path.expanduser("~")):
     """Where the outbox lives when the config doesn't say: the per-user state folder."""
@@ -378,6 +390,9 @@ def browser_item(it, now, keep_query=False):
         raise ValueError("url must be a string")
     if title is not None and not isinstance(title, str):
         raise ValueError("title must be a string")
+    if it.get("private") is True:
+        # A private window's tab: its time, never its address or title.
+        url, title = None, PRIVATE
     domain = None
     if url:
         url = clean_url(url, keep_query)
@@ -640,7 +655,7 @@ class Tracker:
         except Exception as e:
             app, title = None, None
             log(f"[tracker] active-window error: {e}")
-        return ("app", now, app, title) if app is not None else None
+        return ("app", now, app, private_title(title)) if app is not None else None
 
     def tick(self):
         now = self.now()

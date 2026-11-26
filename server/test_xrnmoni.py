@@ -787,6 +787,14 @@ class DayTest(HubTest):
         self.assertEqual([["Intro", "https://docs.example/intro", 150]], got["rows"])
         self.assertEqual(400, self.call("GET", f"/api/detail?{span}")[0])
 
+    def test_a_private_tabs_time_is_the_site_private(self):
+        # The agent sends a private window's tab with no address and the title Private.
+        self.post([ev("app", T0, T0 + 300, app="firefox", title="Private"),
+                   ev("web", T0, T0 + 200, title="Private"), ev("web", T0 + 200, T0 + 300, title="")])
+        laptop = self.day()["laptop"]
+        self.assertEqual([["Private", 200, None], ["?", 100, None]], laptop["sites"])
+        self.assertEqual([[T0, T0 + 200, "Private", None], [T0 + 200, T0 + 300, "?", None]], laptop["web"])
+
     def test_now_is_what_each_device_last_said(self):
         now = time.time()
         self.post([ev("app", now - 120, now - 60, app="zen"), ev("web", now - 120, now - 60, domain="news.example", title="News"),
