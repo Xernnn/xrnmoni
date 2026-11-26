@@ -78,7 +78,9 @@ cookie for good. With `--users` pointing at a users file other xrn services shar
 they share the sign-in and sign-out too.
 
 **Device tokens.** Each agent posts with its own token: put the one `token add NAME`
-printed in that machine's agent config as `token`. A device token only posts events,
+printed in that machine's agent config as `token`. The owner (the users file's first user)
+can also make one on the dashboard's **Devices** page, which shows it once, and revoke it
+there, so a new device needs no shell on the hub. A device token only posts events,
 always under its own device's name, and reads nothing; `token list` shows them and
 `token revoke ID` ends one at once. Only a hash of each is kept. The old single
 `XRNMONI_TOKEN` (environment) still posts, under the name the agent sends, so
@@ -396,8 +398,14 @@ request. `DELETE /api/session` signs out. Times are epoch seconds; each read tak
 | `GET /api/categories` | the category rules; `ETag` is their version |
 | `PUT /api/categories` | `{"rules": [{"kind": "app" or "site", "pattern", "category"}]}`; needs `If-Match` (`428` without, `412` if changed) |
 | `GET /api/changes?seq=&wait=` | answers `{"seq"}` as soon as an agent posts, or after `wait` seconds (at most 30) |
+| `GET /api/tokens` | the owner only: each device token's `id`, `device`, `created` and the device's `last_seen` (never the token) |
+| `POST /api/tokens` | the owner only: `{"device"}` makes a token, answered `{"id", "device", "token"}` this once |
+| `DELETE /api/tokens/<id>` | the owner only: revokes one at once |
+| `GET /api/downloads` | a viewer, **or a device token**: the files in `DIR/downloads` with `kind`, `size`, `sha256` and an `href` that fetches it without a login for an hour |
 
-A range is at most 62 days (400 for the export).
+A range is at most 62 days (400 for the export). `GET /get` is the downloads page, which
+opens with a viewer's sign-in or with the device token the new device will post with, so
+the owner's password is never typed on a monitored device.
 
 ## Roadmap / easy extensions
 

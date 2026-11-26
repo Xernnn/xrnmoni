@@ -27,7 +27,13 @@ may not strip that prefix. Standard library only, plus `bcrypt` to read the user
     GET    /api/categories            the category rules; ETag: "<version>"
     PUT    /api/categories            replaces them; needs If-Match: "<version>" (or "*")
     GET    /api/changes?seq=&wait=    {"seq"}, as soon as it isn't [seq] or [wait] seconds pass
-    GET    /  (and what it asks for)  the dashboard, from web/
+    GET    /api/tokens                the device tokens (the owner only): id, device, made, last post
+    POST   /api/tokens                {"device"}: a new device token, answered once and never again
+    DELETE /api/tokens/<id>           revokes one
+    GET    /api/downloads             what the downloads folder holds, with size, SHA-256 and a link
+                                      good for an hour; for a viewer or a device token
+    GET    /downloads/<name>?k=       one of them, by that link
+    GET    /  (and what it asks for)  the dashboard, from web/; /get is the downloads page
     HEAD                              any GET above, answered without its body
 
 Every read also takes device=NAME for one device. Times are epoch seconds; the dashboard sends the
@@ -39,7 +45,8 @@ with --viewer. Device tokens only post events.
     python3 xrnmoni.py user add|remove|list [NAME] --data DIR [--users FILE]
     python3 xrnmoni.py token add DEVICE|list|revoke ID --data DIR
 
-DIR holds the database, the device tokens, the category rules and, by default, the users file.
+DIR holds the database, the device tokens, the category rules, the downloads/ folder the Get page
+lists (the agents' installers, put there by hand) and, by default, the users file.
 """
 import argparse
 import base64
@@ -108,6 +115,21 @@ USER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 TOKEN = re.compile(r"xrnmoni_([0-9a-f]{8})_([A-Za-z0-9_-]{43})")
 TOKEN_ID = re.compile(r"[0-9a-f]{8}")
 MAX_TOKENS = 50
+DOWNLOAD_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,120}")
+DOWNLOAD_TYPES = {
+    ".apk": "application/vnd.android.package-archive",
+    ".zip": "application/zip",
+    ".xpi": "application/x-xpinstall",
+    ".gz": "application/gzip",
+    ".exe": "application/vnd.microsoft.portable-executable",
+}
+# What each is for, by its name, in the order the Get page lists them.
+DOWNLOAD_KINDS = (("Windows", lambda n: "windows" in n and n.endswith((".zip", ".exe"))),
+                  ("Linux", lambda n: "linux" in n and n.endswith(".tar.gz")),
+                  ("Android", lambda n: n.endswith(".apk")),
+                  ("Chrome, Edge", lambda n: "extension" in n and n.endswith(".zip")),
+                  ("Firefox", lambda n: n.endswith(".xpi")))
+LINK_S = 3600  # how long a download link from /api/downloads works
 MAX_RULES = 500
 CATEGORY = re.compile(r"[^\x00-\x1f\x7f]{1,40}")
 PATTERN = re.compile(r"[^\x00-\x1f\x7f]{1,200}")
@@ -682,6 +704,7 @@ class Tokens:
         self.path = path
         self.legacy = legacy
         self.lock = threading.Lock()
+        self.writing = threading.Lock()  # add and revoke read the file and write it back
         self.seen = None
         self.found = []
 
@@ -725,6 +748,10 @@ class Tokens:
     def add(self, device):
         if not isinstance(device, str) or not DEVICE_NAME.fullmatch(device.strip()):
             raise ValueError("a device name is 1 to 64 characters, with no control characters")
+        with self.writing:
+            return self._add(device)
+
+    def _add(self, device):
         found = self.read()
         if len(found) >= MAX_TOKENS:
             raise ValueError(f"there are {MAX_TOKENS} tokens already; revoke one first")
@@ -739,12 +766,86 @@ class Tokens:
         return f"xrnmoni_{token_id}_{secret}"
 
     def revoke(self, token_id):
+        with self.writing:
+            return self._revoke(token_id)
+
+    def _revoke(self, token_id):
         found = self.read()
         kept = [t for t in found if t.get("id") != token_id]
         if len(kept) == len(found):
             return False
         write_private(self.path, json.dumps({"tokens": kept}, ensure_ascii=False, indent=1))
         return True
+
+
+# ---- downloads ----------------------------------------------------------------------------------
+
+class Downloads:
+    """The files in DIR/downloads that the Get page offers: the agents' installers, the extension and
+    the phone app, each with its size and SHA-256. A file is fetched by a link this server signed, good
+    for LINK_S, so a plain link (a phone's download manager, which sends no login) can fetch it, while
+    the list itself needs a viewer's login or a device token."""
+
+    def __init__(self, folder):
+        self.folder = folder
+        self.key = secrets.token_bytes(32)  # this process's only: a restart ends the links
+        self.lock = threading.Lock()
+        self.sums = {}  # name -> (file stamp, sha256)
+
+    @staticmethod
+    def kind(name):
+        low = name.lower()
+        return next((label for label, test in DOWNLOAD_KINDS if test(low)), None)
+
+    def mac(self, name, expires):
+        return hmac.new(self.key, f"{name}\x1f{expires}".encode(), hashlib.sha256).hexdigest()[:32]
+
+    def sha256(self, name, path, stamp):
+        with self.lock:
+            hit = self.sums.get(name)
+        if hit and hit[0] == stamp:
+            return hit[1]
+        digest = hashlib.sha256()
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                digest.update(block)
+        with self.lock:
+            self.sums[name] = (stamp, digest.hexdigest())
+        return digest.hexdigest()
+
+    def listing(self, now=None):
+        """[{"name", "kind", "size", "sha256", "modified", "href"}], in DOWNLOAD_KINDS order, newest
+        first within each."""
+        expires = int((now or time.time()) + LINK_S)
+        try:
+            names = os.listdir(self.folder)
+        except FileNotFoundError:
+            return []
+        out = []
+        for name in names:
+            kind = self.kind(name) if DOWNLOAD_NAME.fullmatch(name) else None
+            path = os.path.join(self.folder, name)
+            stamp = file_stamp(path)
+            if not kind or stamp is None or not os.path.isfile(path):
+                continue
+            out.append({"name": name, "kind": kind, "size": stamp[2], "sha256": self.sha256(name, path, stamp),
+                        "modified": int(os.stat(path).st_mtime),
+                        "href": f"downloads/{name}?k={expires}.{self.mac(name, expires)}"})
+        order = [label for label, _ in DOWNLOAD_KINDS]
+        out.sort(key=lambda f: (order.index(f["kind"]), -f["modified"], f["name"]))
+        return out
+
+    def path(self, name, key, now=None):
+        """The file a signed link names, or None: a made-up, changed or run-out link opens nothing."""
+        if not DOWNLOAD_NAME.fullmatch(name) or not self.kind(name):
+            return None
+        expires, _, mac = (key or "").partition(".")
+        if not expires.isdigit() or int(expires) < (now or time.time()):
+            return None
+        if not hmac.compare_digest(mac, self.mac(name, int(expires))):
+            return None
+        path = os.path.join(self.folder, name)
+        return path if os.path.isfile(path) else None
 
 
 # ---- logins -------------------------------------------------------------------------------------
@@ -1184,11 +1285,16 @@ class App:
         self.tokens = Tokens(os.path.join(data, "tokens.json"), legacy_token)
         self.categories = Categories(os.path.join(data, "categories.json"))
         self.categories_lock = threading.Lock()
+        self.downloads = Downloads(os.path.join(data, "downloads"))
         self.changes = Changes()
         self.pages = {}  # web file -> (stamp, ETag, bytes)
 
     def is_viewer(self, user):
-        return user in self.viewers or user == next(iter(read_names(self.users)), None)
+        return user in self.viewers or self.is_owner(user)
+
+    def is_owner(self, user):
+        """The users file's first user: the only one who makes and revokes device tokens."""
+        return user is not None and user == next(iter(read_names(self.users)), None)
 
     def prune(self, now=None):
         if not self.retain_days:
@@ -1378,6 +1484,14 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return user
 
+    def owner(self):
+        """The signed-in owner, or None once a refusal has been answered."""
+        user = self.viewer()
+        if user and not self.app.is_owner(user):
+            self.send(403, "only the owner manages devices")
+            return None
+        return user
+
     def device_token(self):
         """(device name or None, True) for a device token, or (None, False) once a refusal has been
         answered. Wrong tokens count as wrong logins."""
@@ -1415,8 +1529,14 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, "ok")
         if path == "/healthz":
             return self.send(200, '{"ok":true}', JSON)
+        if path.startswith("/downloads/"):
+            return self.send_download(path[len("/downloads/"):])
         if not path.startswith("/api/"):
             return self.serve_web(path)
+        if path == "/api/downloads":
+            return self.get_downloads()
+        if path == "/api/tokens":
+            return self.get_tokens() if self.owner() else None
         reads = {"/api/devices": self.get_devices, "/api/day": self.get_day, "/api/days": self.get_days,
                  "/api/detail": self.get_detail, "/api/activity": self.get_activity,
                  "/api/export": self.get_export, "/api/summary": self.get_summary,
@@ -1448,6 +1568,8 @@ class Handler(BaseHTTPRequestHandler):
                 return None
             cookie = session_cookie(self.app.login.make_session(user), SESSION_S, self.secure_cookie())
             return self.send(200, json.dumps({"ok": True, "user": user}), JSON, {"Set-Cookie": cookie})
+        if path == "/api/tokens":
+            return self.post_token()
         if path != "/api/events":
             return self.send(404, "not found")
         device, ok = self.device_token()
@@ -1517,8 +1639,33 @@ class Handler(BaseHTTPRequestHandler):
             app.categories.write(version, rules)
         return self.send_json({"version": version, "rules": rules}, {"ETag": f'"{version}"'})
 
+    def post_token(self):
+        """Makes a device token for a new device, for the owner: answered this once, kept only as a hash."""
+        if not self.owner():
+            return None
+        doc = self.body()
+        if doc is None:
+            return None
+        device = doc.get("device") if isinstance(doc, dict) else None
+        try:
+            token = self.app.tokens.add(device)
+        except ValueError as e:
+            return self.send(400, str(e))
+        except OSError as e:
+            log(f"tokens: {e}")
+            return self.send(503, "the tokens can't be written")
+        return self.send_json({"id": token[8:16], "device": device.strip(), "token": token})
+
     def do_DELETE(self):
-        if self.route() != "/api/session":
+        path = self.route()
+        if path.startswith("/api/tokens/"):
+            if not self.owner():
+                return None
+            token_id = path[len("/api/tokens/"):]
+            if not TOKEN_ID.fullmatch(token_id) or not self.app.tokens.revoke(token_id):
+                return self.send(404, "no such token")
+            return self.send_json({"ok": True})
+        if path != "/api/session":
             return self.send(404, "not found")
         # Emptying the browser's cookie alone left any copy of it signing in for its full 30 days.
         self.app.login.end_session(self.headers.get("Cookie"))
@@ -1659,6 +1806,50 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(buf.getvalue().encode("utf-8"))
         return None
 
+    def get_tokens(self):
+        heard = {d["device"]: d["last_seen"] for d in self.app.store.devices()}
+        return self.send_json({"tokens": [
+            {"id": t.get("id"), "device": t.get("device"), "created": t.get("created"),
+             "last_seen": heard.get(t.get("device"))} for t in self.app.tokens.read()]})
+
+    def get_downloads(self):
+        """The Get page's list: for a viewer, or a device token, so a child's device can be set up
+        with the token it will post with, never the owner's password."""
+        if (self.headers.get("Authorization") or "").startswith("Bearer "):
+            if not self.device_token()[1]:
+                return None
+        elif not self.viewer():
+            return None
+        try:
+            files = self.app.downloads.listing()
+        except OSError as e:
+            log(f"downloads: {e}")
+            return self.send(503, "the downloads can't be read")
+        return self.send_json({"files": files})
+
+    def send_download(self, name):
+        path = self.app.downloads.path(name, self.query().get("k"))
+        if not path:
+            return self.send(403, "link expired")
+        try:
+            f = open(path, "rb")
+        except OSError:
+            return self.send(404, "not found")
+        with f:
+            self.send_response(200)
+            self.send_header("Cache-Control", "no-store")
+            for k, v in BASE_HEADERS.items():
+                self.send_header(k, v)
+            self.send_header("Content-Type", DOWNLOAD_TYPES[os.path.splitext(name)[1].lower()])
+            self.send_header("Content-Length", str(os.fstat(f.fileno()).st_size))
+            self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+            self.end_headers()
+            if self.command == "HEAD":
+                return None
+            for block in iter(lambda: f.read(1 << 16), b""):
+                self.wfile.write(block)
+        return None
+
     def get_categories(self, q):
         doc = self.app.categories.read()
         etag = f'"{doc["version"]}"'
@@ -1689,7 +1880,7 @@ class Handler(BaseHTTPRequestHandler):
             return True
 
     def serve_web(self, path):
-        name = "index.html" if path in ("", "/") else path.lstrip("/")
+        name = "index.html" if path in ("", "/") else "get.html" if path == "/get" else path.lstrip("/")
         if not WEB_NAME.fullmatch(name) or ".." in name:
             return self.send(404, "not found")
         ctype = WEB_TYPES.get(os.path.splitext(name)[1])
@@ -1701,7 +1892,7 @@ class Handler(BaseHTTPRequestHandler):
         if not hit or hit[0] != stamp:
             with open(full, "rb") as f:
                 body = f.read()
-            if name == "index.html":
+            if name.endswith(".html"):
                 # Every path the page uses is relative to this, so it works under any prefix.
                 body = body.replace(b'<base href="/xrnmoni/">', f'<base href="{self.app.prefix}/">'.encode())
             hit = (stamp, '"' + hashlib.sha256(body).hexdigest()[:16] + '"', body)
