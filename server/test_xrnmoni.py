@@ -795,6 +795,15 @@ class DownloadsTest(HubTest):
             data = self.FILES[f["name"]]
             self.assertEqual((len(data), hashlib.sha256(data).hexdigest()), (f["size"], f["sha256"]))
 
+    def test_only_the_newest_of_each_kind_is_offered(self):
+        folder = os.path.join(self.data, "downloads")
+        with open(os.path.join(folder, "xrnmoni-1.2.0.apk"), "wb") as f:
+            f.write(b"newer")
+        old = time.time() - 86400
+        os.utime(os.path.join(folder, "xrnmoni-1.1.0.apk"), (old, old))
+        apks = [f["name"] for f in self.listing()[1] if f["kind"] == "Android"]
+        self.assertEqual(["xrnmoni-1.2.0.apk"], apks)
+
     def test_a_device_token_lists_them_so_the_owners_password_never_goes_on_a_childs_device(self):
         self.assertEqual(200, self.listing(auth="Bearer " + self.token)[0])
         self.assertEqual(401, self.listing(auth="Bearer xrnmoni_00000000_" + "A" * 43)[0])

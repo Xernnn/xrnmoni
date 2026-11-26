@@ -814,25 +814,30 @@ class Downloads:
         return digest.hexdigest()
 
     def listing(self, now=None):
-        """[{"name", "kind", "size", "sha256", "modified", "href"}], in DOWNLOAD_KINDS order, newest
-        first within each."""
+        """[{"name", "kind", "size", "sha256", "modified", "href"}]: the newest file of each kind, in
+        DOWNLOAD_KINDS order. An older version left in the folder isn't offered."""
         expires = int((now or time.time()) + LINK_S)
         try:
             names = os.listdir(self.folder)
         except FileNotFoundError:
             return []
-        out = []
+        newest = {}
         for name in names:
             kind = self.kind(name) if DOWNLOAD_NAME.fullmatch(name) else None
             path = os.path.join(self.folder, name)
-            stamp = file_stamp(path)
-            if not kind or stamp is None or not os.path.isfile(path):
+            if not kind or not os.path.isfile(path):
                 continue
-            out.append({"name": name, "kind": kind, "size": stamp[2], "sha256": self.sha256(name, path, stamp),
-                        "modified": int(os.stat(path).st_mtime),
-                        "href": f"downloads/{name}?k={expires}.{self.mac(name, expires)}"})
-        order = [label for label, _ in DOWNLOAD_KINDS]
-        out.sort(key=lambda f: (order.index(f["kind"]), -f["modified"], f["name"]))
+            st = os.stat(path)
+            if kind not in newest or (st.st_mtime, name) > newest[kind][0]:
+                newest[kind] = ((st.st_mtime, name), path)
+        out = []
+        for label, _ in DOWNLOAD_KINDS:
+            if label not in newest:
+                continue
+            (mtime, name), path = newest[label]
+            stamp = file_stamp(path)
+            out.append({"name": name, "kind": label, "size": stamp[2], "sha256": self.sha256(name, path, stamp),
+                        "modified": int(mtime), "href": f"downloads/{name}?k={expires}.{self.mac(name, expires)}"})
         return out
 
     def path(self, name, key, now=None):
