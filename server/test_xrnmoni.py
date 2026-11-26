@@ -696,6 +696,157 @@ class ViewerTest(HubTest):
         self.assertEqual(200, self.call("GET", "/api/devices", auth=("guest", GUEST))[0])
 
 
+class DeviceTokenTest(HubTest):
+    """The dashboard's Devices page: the owner makes a token for a new device there, without ssh."""
+
+    viewers = ("guest",)
+
+    def make(self, device, auth=("alex", RIGHT), headers=None):
+        status, raw, _ = self.call("POST", "/api/tokens", {"device": device}, headers, auth=auth)
+        return status, (json.loads(raw) if raw.startswith(b"{") else raw)
+
+    def test_the_owner_makes_a_token_that_posts_as_that_device_and_is_shown_once(self):
+        status, made = self.make("kid-phone")
+        self.assertEqual(200, status, made)
+        self.assertEqual("kid-phone", made["device"])
+        self.assertRegex(made["token"], srv.TOKEN)
+        self.assertEqual(made["id"], made["token"][8:16])
+        self.assertEqual(200, self.post([ev("app", T0, T0 + 60, app="YouTube")], token=made["token"], device="x")[0])
+        self.assertEqual({"kid-phone"}, {d["device"] for d in self.get("/api/devices")["devices"]} - {"laptop", "pc"})
+        listed = self.get("/api/tokens")["tokens"]
+        mine = [t for t in listed if t["id"] == made["id"]]
+        self.assertEqual(1, len(mine))
+        self.assertEqual({"id", "device", "created", "last_seen"}, set(mine[0]))
+        self.assertIsNotNone(mine[0]["last_seen"])
+        self.assertNotIn(made["token"][17:], json.dumps(listed))
+
+    def test_the_dashboard_makes_one_with_its_cookie(self):
+        status, _, h = self.call("POST", "/api/session", auth=("alex", RIGHT), headers={"X-Xrn-Client": "xrnmoni"})
+        cookie = h["Set-Cookie"].split(";")[0]
+        status, made = self.make("kid-laptop", auth=None, headers={"Cookie": cookie, "X-Xrn-Client": "xrnmoni"})
+        self.assertEqual(200, status, made)
+        # Not with the cookie alone, which another site's form could make the browser send.
+        self.assertEqual(401, self.make("x", auth=None, headers={"Cookie": cookie})[0])
+
+    def test_only_the_owner_makes_lists_or_revokes_them(self):
+        self.assertEqual(200, self.call("GET", "/api/devices", auth=("guest", GUEST))[0])
+        self.assertEqual(403, self.make("kid-phone", auth=("guest", GUEST))[0])
+        self.assertEqual(403, self.call("GET", "/api/tokens", auth=("guest", GUEST))[0])
+        laptop_id = self.token[8:16]
+        self.assertEqual(403, self.call("DELETE", f"/api/tokens/{laptop_id}", auth=("guest", GUEST))[0])
+        for auth in ("Bearer " + self.token, None):
+            self.assertEqual(401, self.make("kid-phone", auth=auth)[0])
+        self.assertEqual(2, len(self.app.tokens.read()))
+
+    def test_a_page_on_another_site_cant_make_one(self):
+        status, _ = self.make("evil", headers={"Origin": "https://evil.example", "Sec-Fetch-Site": "cross-site"})
+        self.assertEqual(403, status)
+        self.assertEqual(2, len(self.app.tokens.read()))
+
+    def test_a_revoked_token_posts_nothing_more(self):
+        laptop_id = self.token[8:16]
+        self.assertEqual(200, self.call("DELETE", f"/api/tokens/{laptop_id}")[0])
+        self.assertEqual(401, self.post([ev("app", T0, T0 + 60, app="code")])[0])
+        self.assertEqual(["pc"], [t["device"] for t in self.get("/api/tokens")["tokens"]])
+        for bad in (laptop_id, "nothing1", "../x"):
+            self.assertEqual(404, self.call("DELETE", f"/api/tokens/{bad}")[0], bad)
+
+    def test_a_bad_name_is_refused(self):
+        for bad in ("", "   ", "a\nb", "x" * 65, 7, None):
+            self.assertEqual(400, self.make(bad)[0], bad)
+        self.assertEqual(400, self.call("POST", "/api/tokens", [1], auth=("alex", RIGHT))[0])
+
+    def test_tokens_made_at_once_are_all_kept(self):
+        made = []
+        threads = [threading.Thread(target=lambda i=i: made.append(self.make(f"d{i}")[1]["id"])) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(set(made), {t["id"] for t in self.app.tokens.read()} - {self.token[8:16], self.pc_token[8:16]})
+
+
+class DownloadsTest(HubTest):
+    """The Get page: the agents' installers, the extension and the phone app, from DIR/downloads."""
+
+    FILES = {"xrnmoni-1.1.0.apk": b"apk" * 1000, "xrnmoni-windows-1.1.0.zip": b"win" * 2000,
+             "xrnmoni-linux-1.1.0.tar.gz": b"lin" * 300, "xrnmoni-extension-1.1.0.zip": b"zip" * 10,
+             "xrnmoni-extension-1.1.0.xpi": b"xpi" * 10, "notes.txt": b"not offered", ".partial.apk": b"half"}
+
+    def setUp(self):
+        super().setUp()
+        folder = os.path.join(self.data, "downloads")
+        os.makedirs(folder)
+        for name, data in self.FILES.items():
+            with open(os.path.join(folder, name), "wb") as f:
+                f.write(data)
+
+    def listing(self, auth=("alex", RIGHT)):
+        status, raw, _ = self.call("GET", "/api/downloads", auth=auth)
+        return status, (json.loads(raw)["files"] if status == 200 else raw)
+
+    def test_the_list_says_what_each_is_for_with_its_size_and_sha256(self):
+        status, files = self.listing()
+        self.assertEqual(200, status, files)
+        self.assertEqual([("Windows", "xrnmoni-windows-1.1.0.zip"), ("Linux", "xrnmoni-linux-1.1.0.tar.gz"),
+                          ("Android", "xrnmoni-1.1.0.apk"), ("Chrome, Edge", "xrnmoni-extension-1.1.0.zip"),
+                          ("Firefox", "xrnmoni-extension-1.1.0.xpi")], [(f["kind"], f["name"]) for f in files])
+        for f in files:
+            data = self.FILES[f["name"]]
+            self.assertEqual((len(data), hashlib.sha256(data).hexdigest()), (f["size"], f["sha256"]))
+
+    def test_only_the_newest_of_each_kind_is_offered(self):
+        folder = os.path.join(self.data, "downloads")
+        with open(os.path.join(folder, "xrnmoni-1.2.0.apk"), "wb") as f:
+            f.write(b"newer")
+        old = time.time() - 86400
+        os.utime(os.path.join(folder, "xrnmoni-1.1.0.apk"), (old, old))
+        apks = [f["name"] for f in self.listing()[1] if f["kind"] == "Android"]
+        self.assertEqual(["xrnmoni-1.2.0.apk"], apks)
+
+    def test_a_device_token_lists_them_so_the_owners_password_never_goes_on_a_childs_device(self):
+        self.assertEqual(200, self.listing(auth="Bearer " + self.token)[0])
+        self.assertEqual(401, self.listing(auth="Bearer xrnmoni_00000000_" + "A" * 43)[0])
+        self.assertEqual(401, self.listing(auth=None)[0])
+        self.assertEqual(401, self.listing(auth=("alex", "wrong"))[0])
+
+    def test_a_link_fetches_the_file_without_a_login_until_it_runs_out(self):
+        apk = next(f for f in self.listing()[1] if f["kind"] == "Android")
+        status, body, headers = self.call("GET", "/" + apk["href"], auth=None)
+        self.assertEqual(200, status)
+        self.assertEqual(self.FILES["xrnmoni-1.1.0.apk"], body)
+        self.assertEqual("application/vnd.android.package-archive", headers["Content-Type"])
+        self.assertEqual('attachment; filename="xrnmoni-1.1.0.apk"', headers["Content-Disposition"])
+        self.assertEqual("nosniff", headers["X-Content-Type-Options"])
+        status, body, headers = self.call("HEAD", "/xrnmoni/" + apk["href"], auth=None)
+        self.assertEqual((200, b"", str(len(self.FILES["xrnmoni-1.1.0.apk"]))), (status, body, headers["Content-Length"]))
+        later = time.time() + srv.LINK_S + 5
+        with unittest.mock.patch.object(srv.time, "time", return_value=later):
+            self.assertEqual(403, self.call("GET", "/" + apk["href"], auth=None)[0])
+
+    def test_a_made_up_or_changed_link_opens_nothing(self):
+        href = next(f for f in self.listing()[1] if f["kind"] == "Android")["href"]
+        name, _, key = href.partition("?k=")
+        expires, _, mac = key.partition(".")
+        later = int(expires) + 86400
+        for bad in (name, f"{name}?k={later}.{mac}", f"{name}?k={expires}.{'0' * 32}",
+                    f"downloads/xrnmoni-windows-1.1.0.zip?k={key}", f"downloads/notes.txt?k={key}",
+                    f"downloads/..%2Fxrnmoni.db?k={key}", f"downloads/.partial.apk?k={key}"):
+            self.assertIn(self.call("GET", "/" + bad, auth=None)[0], (403, 404), bad)
+
+    def test_no_downloads_folder_is_an_empty_list(self):
+        import shutil
+        shutil.rmtree(os.path.join(self.data, "downloads"))
+        self.assertEqual((200, []), self.listing())
+
+    def test_the_get_page_is_served_under_the_prefix(self):
+        for path in ("/get", "/xrnmoni/get"):
+            status, body, _ = self.call("GET", path, auth=None)
+            self.assertEqual(200, status, path)
+            self.assertIn(b'<base href="/xrnmoni/">', body)
+            self.assertIn(b'src="get.js"', body)
+
+
 class DayTest(HubTest):
     """What the dashboard draws a day from."""
 
@@ -786,6 +937,14 @@ class DayTest(HubTest):
         got = self.get(f"/api/detail?{span}&site=docs.example")
         self.assertEqual([["Intro", "https://docs.example/intro", 150]], got["rows"])
         self.assertEqual(400, self.call("GET", f"/api/detail?{span}")[0])
+
+    def test_a_private_tabs_time_is_the_site_private(self):
+        # The agent sends a private window's tab with no address and the title Private.
+        self.post([ev("app", T0, T0 + 300, app="firefox", title="Private"),
+                   ev("web", T0, T0 + 200, title="Private"), ev("web", T0 + 200, T0 + 300, title="")])
+        laptop = self.day()["laptop"]
+        self.assertEqual([["Private", 200, None], ["?", 100, None]], laptop["sites"])
+        self.assertEqual([[T0, T0 + 200, "Private", None], [T0 + 200, T0 + 300, "?", None]], laptop["web"])
 
     def test_now_is_what_each_device_last_said(self):
         now = time.time()
@@ -960,10 +1119,11 @@ class WebTest(HubTest):
     def test_text_from_agents_never_goes_in_as_html(self):
         # Window and page titles are chosen by whatever was open; the first dashboard's innerHTML
         # let a page titled with markup run script in it.
-        with open(os.path.join(HERE, "web", "app.js"), encoding="utf-8") as f:
-            script = f.read()
-        for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval("):
-            self.assertNotIn(sink, script)
+        for name in ("app.js", "get.js"):
+            with open(os.path.join(HERE, "web", name), encoding="utf-8") as f:
+                script = f.read()
+            for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval("):
+                self.assertNotIn(sink, script, name)
 
     def test_the_page_is_revalidated_not_kept(self):
         _, headers = self.page("/app.js")

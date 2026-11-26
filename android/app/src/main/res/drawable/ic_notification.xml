@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The notification's small icon: the launcher's monochrome glyph, filling the 24 dp square. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="68"
+    android:viewportHeight="68">
+    <group android:translateX="-16" android:translateY="-16.5">
+        <path android:pathData="M28,26.75 H72 A5.25,5.25 0 0 1 77.25,32 V56 A5.25,5.25 0 0 1 72,61.25 H28 A5.25,5.25 0 0 1 22.75,56 V32 A5.25,5.25 0 0 1 28,26.75 Z" android:strokeColor="#FFFFFF" android:strokeWidth="5.5" />
+        <path android:pathData="M45,62 H55 V70 H63 A3.5,3.5 0 0 1 63,77 H37 A3.5,3.5 0 0 1 37,70 H45 Z" android:fillColor="#FFFFFF" />
+        <path
+            android:pathData="M28,45 H37 L42,35 L50,54 L56,41 L59,45 H72"
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="5.5"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round" />
+    </group>
+</vector>

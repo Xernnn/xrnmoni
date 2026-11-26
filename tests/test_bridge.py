@@ -158,6 +158,21 @@ class UrlTest(BridgeCase):
                          "https://Mail.Example.com/inbox/42?q=secret&token=abc#msg-9")
 
 
+class PrivateTabTest(BridgeCase):
+    def test_a_private_tab_keeps_its_time_but_not_its_address_or_title(self):
+        self.start()
+        page = self.page(url="https://mail.example.com/inbox/42", title="Inbox (3)", private=True)
+        self.assertEqual(self.post(page)[0], 200)
+        e = self.sender.events[0]
+        self.assertEqual((e["url"], e["domain"], e["title"]), (None, None, "Private"))
+        self.assertEqual((e["ts_start"], e["ts_end"]), (T, T + 20))
+
+    def test_private_must_be_true_to_count(self):
+        self.start()
+        self.assertEqual(self.post(self.page(private="no"))[0], 200)
+        self.assertEqual(self.sender.events[0]["domain"], "example.com")
+
+
 class GatingTest(BridgeCase):
     def spans(self):
         return [(e["ts_start"] - T, e["ts_end"] - T) for e in self.sender.events]

@@ -1,0 +1,104 @@
+name: Release
+
+# A v* tag builds what a monitored device installs and attaches it to a draft release of that
+# tag: the Windows package (xrnmoni-agent.exe with Python inside, the scripts and the extension),
+# the Linux bundle, and the extension as a .zip (Chromium, Edge) and an .xpi (Firefox, Zen). The
+# Android APK is signed with the owner's key on their own machine and added to the draft by hand;
+# nothing is public until the draft is published.
+#
+#   git tag v1.1.0 && git push origin v1.1.0
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      - name: Tests
+        run: |
+          pip install -r server/requirements.txt -r agent/requirements.txt
+          python -m unittest server/test_xrnmoni.py server/test_deploy.py
+          python -m unittest discover tests
+          node --test server/test_web.mjs tests/test_background.mjs
+
+      # Both packaging jobs upload to this one draft. `gh release list` shows drafts too (a draft
+      # isn't found by its tag), so a re-run reuses the first one.
+      - name: The draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release list --limit 100 --json tagName --jq '.[].tagName' | grep -qx "$GITHUB_REF_NAME"; then
+            echo "Release $GITHUB_REF_NAME already exists"
+          else
+            gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
+              --title "xrnmoni ${GITHUB_REF_NAME#v}" --notes "Add the signed APK, then publish."
+          fi
+
+  windows:
+    needs: draft
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Build xrnmoni-agent.exe and the package around it
+        shell: powershell
+        run: |
+          .\windows\build-exe.ps1 -Python (Get-Command python).Source
+          if ($LASTEXITCODE) { exit 1 }
+          python windows\ci\check.py exe windows\dist\xrnmoni-agent\xrnmoni-agent.exe
+          if ($LASTEXITCODE) { exit 1 }
+
+      - name: Zip it as xrnmoni-windows-<version>.zip and attach it
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = "$env:GITHUB_REF_NAME".TrimStart('v')
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          $zip = "release\xrnmoni-windows-$version.zip"
+          Compress-Archive -Path windows\dist\xrnmoni-windows -DestinationPath $zip
+          Get-FileHash -Algorithm SHA256 $zip | Format-List
+          gh release upload "$env:GITHUB_REF_NAME" $zip --clobber
+          if ($LASTEXITCODE) { exit 1 }
+
+  linux-and-extension:
+    needs: draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      - name: The Linux bundle and the extension packages, attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          python scripts/bundle-linux.py --version "$version" --out release
+          python scripts/package-extension.py --out release
+          sha256sum release/*
+          gh release upload "$GITHUB_REF_NAME" release/* --clobber

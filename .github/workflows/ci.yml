@@ -35,8 +35,12 @@ jobs:
       - name: Server tests
         run: python -m unittest server/test_xrnmoni.py
 
-      - name: Dashboard date tests
-        run: node --test server/test_web.mjs
+      - name: deploy.sh and put-downloads.sh against a made-up server
+        if: runner.os == 'Linux'
+        run: python -m unittest server/test_deploy.py
+
+      - name: Dashboard date tests, the extension's posts and icons
+        run: node --test server/test_web.mjs tests/test_background.mjs tests/test_icons.mjs
 
       - name: Tests
         run: python -m unittest discover tests
@@ -223,6 +227,17 @@ jobs:
           foreach ($p in @($XrnConfig, $XrnLogs)) { if (-not (Test-Path $p)) { $fail += "$p is gone" } }
           if ($fail.Count) { Write-Host "::error::$($fail -join '; ')"; exit 1 }
 
+      - name: private-windows.ps1 closes private windows in every Chromium browser, and -Undo opens them
+        shell: powershell
+        run: |
+          powershell -ExecutionPolicy Bypass -File windows\admin\private-windows.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $want = @{ 'HKLM:\SOFTWARE\Policies\Google\Chrome' = 'IncognitoModeAvailability'; 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' = 'InPrivateModeAvailability'; 'HKLM:\SOFTWARE\Policies\BraveSoftware\Brave' = 'TorDisabled' }
+          foreach ($k in $want.Keys) { $v = (Get-ItemProperty -LiteralPath $k -Name $want[$k]).($want[$k]); if ($v -ne 1) { throw "$k $($want[$k]) is $v" } }
+          powershell -ExecutionPolicy Bypass -File windows\admin\private-windows.ps1 -Status
+          powershell -ExecutionPolicy Bypass -File windows\admin\private-windows.ps1 -Undo
+          if ($null -ne (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Policies\Google\Chrome' -Name IncognitoModeAvailability -ErrorAction SilentlyContinue)) { throw 'still set after -Undo' }
+
       - name: Build xrnmoni-agent.exe - windowed, CA bundle inside
         shell: powershell
         run: |
@@ -266,3 +281,27 @@ jobs:
           Write-Host '== hub requests'; Get-Content "$env:RUNNER_TEMP\hub-requests.jsonl" -ErrorAction SilentlyContinue
           Write-Host '== hub log'; Get-Content "$env:RUNNER_TEMP\hub\xrnmoni.log" -Tail 50 -ErrorAction SilentlyContinue
           & .\windows\status.ps1
+
+  # The Android agent (android/): its JVM tests (the tracker, the outbox, the sender against a fake
+  # hub) and a debug APK. Release builds are signed on the owner's machine, never here.
+  android:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+
+      - name: Point Gradle at the SDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" > /dev/null
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
+
+      - name: JVM tests and a debug APK
+        run: ./gradlew --no-daemon :app:testDebugUnitTest :app:assembleDebug

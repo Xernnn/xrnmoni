@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Only the window before Compose draws; the screen itself has its own light and dark colours. -->
+    <style name="Theme.Xrnmoni" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">#F6F6F7</item>
+    </style>
+</resources>

@@ -1,4 +1,4 @@
-// The dashboard: each device's day, the week, and the category rules.
+// The dashboard: each device's day, the week, the category rules, and the devices' tokens.
 //
 // Everything shown comes from agents, and window and page titles are chosen by whatever app or
 // website was open, so text only ever goes in through textContent, never as HTML.
@@ -185,7 +185,7 @@ async function loadDevices() {
 
 function readHash() {
   const p = new URLSearchParams(location.hash.slice(1));
-  const view = ["day", "week", "rules"].includes(p.get("v")) ? p.get("v") : "day";
+  const view = ["day", "week", "rules", "devices"].includes(p.get("v")) ? p.get("v") : "day";
   const date = parseKey(p.get("d")) ? p.get("d") : today();
   return { view, date, device: p.get("dev") || "", colour: p.get("c") === "cat" ? "cat" : "app" };
 }
@@ -282,7 +282,8 @@ function header() {
     onchange: (e) => parseKey(e.target.value) && go({ date: e.target.value }),
   });
   const step = state.view === "week" ? 7 : 1;
-  const dates = state.view === "rules" ? null : h("div", { class: "dates" },
+  const plain = state.view === "rules" || state.view === "devices"; // no dates, devices or CSV
+  const dates = plain ? null : h("div", { class: "dates" },
     h("button", { class: "icon-btn", type: "button", "aria-label": "Earlier", text: "‹", onclick: () => go({ date: shiftKey(state.date, -step) }) }),
     date,
     h("button", {
@@ -300,11 +301,12 @@ function header() {
   return h("header", { class: "bar" },
     h("div", { class: "left" },
       h("img", { class: "tile", src: "icon.svg", alt: "xrnmoni" }),
-      segmented([["day", "Day"], ["week", "Week"], ["rules", "Rules"]], state.view, (view) => go({ view }))),
-    state.view === "rules" ? null : h("div", { class: "filters" },
+      segmented([["day", "Day"], ["week", "Week"], ["rules", "Rules"], ["devices", "Devices"]], state.view,
+        (view) => go({ view }))),
+    plain ? null : h("div", { class: "filters" },
       dates, picker, segmented([["app", "Apps"], ["cat", "Categories"]], state.colour, (colour) => go({ colour }))),
     h("div", { class: "right" },
-      state.view === "rules" ? null : h("button", { type: "button", text: "CSV", onclick: exportCsv }),
+      plain ? null : h("button", { type: "button", text: "CSV", onclick: exportCsv }),
       h("button", {
         class: "icon-btn", type: "button", "aria-label": "Theme", title: "Theme",
         onclick: () => {
@@ -327,7 +329,7 @@ async function render(live = false) {
   }
   let body;
   try {
-    body = state.view === "day" ? await dayView() : state.view === "week" ? await weekView() : await rulesView();
+    body = await { day: dayView, week: weekView, rules: rulesView, devices: devicesView }[state.view]();
   } catch (e) {
     if (e instanceof Unauthorized) return;
     if (live) return; // keep what's on screen; the next change tries again
@@ -810,6 +812,104 @@ async function rulesView() {
       h("div", { class: "cols" },
         h("div", { class: "list" }, h("h3", { text: "Apps without one · 7 days" }), apps.length ? apps : h("div", { class: "none", text: "—" })),
         h("div", { class: "list" }, h("h3", { text: "Sites without one · 7 days" }), sites.length ? sites : h("div", { class: "none", text: "—" })))) : null,
+  ];
+}
+
+// ---- devices: a token for each, made here so a new device needs no ssh ---------------------------
+
+async function devicesView() {
+  const res = await fetch("api/tokens", { credentials: "same-origin", headers: CLIENT });
+  if (res.status === 401) {
+    showSignIn();
+    throw new Unauthorized();
+  }
+  if (res.status === 403) return h("div", { class: "empty", text: "Owner only" });
+  if (!res.ok) throw new Error(String(res.status));
+  const { tokens } = await res.json();
+  await loadDevices().catch(() => null);
+
+  const box = h("div", { class: "tokens" });
+  const row = (t) => {
+    const revoke = h("button", { type: "button", text: "Revoke" });
+    revoke.addEventListener("click", async () => {
+      if (revoke.textContent !== "Revoke?") {
+        revoke.textContent = "Revoke?"; // a second click to be sure
+        return;
+      }
+      revoke.disabled = true;
+      const del = await fetch(`api/tokens/${encodeURIComponent(t.id)}`, { method: "DELETE", credentials: "same-origin", headers: CLIENT })
+        .catch(() => null);
+      if (del && del.status === 401) return showSignIn();
+      if (!del || !del.ok) {
+        revoke.disabled = false;
+        revoke.textContent = del ? `Error ${del.status}` : "Server unreachable";
+        return;
+      }
+      el.remove();
+    });
+    const el = h("div", { class: "token" },
+      h("span", { class: "dot" + (t.last_seen && nowS() - t.last_seen < ONLINE_S ? " on" : "") }),
+      h("span", { class: "n", text: t.device, title: t.device }),
+      t.last_seen ? h("span", { class: "age", "data-seen": t.last_seen, text: ago(nowS() - t.last_seen) })
+        : h("span", { class: "age", text: "—" }),
+      h("code", { class: "id", text: t.id }),
+      revoke);
+    return el;
+  };
+  box.replaceChildren(...(tokens.length ? tokens.map(row) : [h("div", { class: "none", text: "—" })]));
+
+  const name = h("input", { placeholder: "Name", "aria-label": "Device name", maxlength: "64", required: true });
+  const add = h("button", { class: "primary", type: "submit", text: "Add" });
+  const msg = h("span", { class: "msg" });
+  const made = h("div", { class: "made", hidden: true });
+  const form = h("form", {
+    class: "actions",
+    onsubmit: async (e) => {
+      e.preventDefault();
+      add.disabled = true;
+      msg.textContent = "";
+      try {
+        const post = await fetch("api/tokens", {
+          method: "POST", credentials: "same-origin",
+          headers: { ...CLIENT, "Content-Type": "application/json" },
+          body: JSON.stringify({ device: name.value.trim() }),
+        });
+        if (post.status === 401) return showSignIn();
+        if (!post.ok) {
+          msg.textContent = (await post.text()) || `Error ${post.status}`;
+          return;
+        }
+        const t = await post.json();
+        box.querySelector(".none")?.remove();
+        box.append(row({ id: t.id, device: t.device, last_seen: null }));
+        // Shown this once: the hub keeps only its hash.
+        const code = h("code", { class: "secret", text: t.token });
+        const copy = h("button", {
+          type: "button", text: "Copy",
+          onclick: async () => {
+            try {
+              await navigator.clipboard.writeText(t.token);
+              copy.textContent = "Copied";
+            } catch {
+              getSelection().selectAllChildren(code);
+            }
+          },
+        });
+        made.replaceChildren(h("div", { class: "k", text: t.device }), code, h("div", { class: "actions" }, copy));
+        made.hidden = false;
+        name.value = "";
+      } catch {
+        msg.textContent = "Server unreachable";
+      } finally {
+        add.disabled = false;
+      }
+    },
+  }, name, add, msg);
+
+  return [
+    h("section", { class: "card" }, h("div", { class: "list" }, h("h3", { text: "Devices" })), box, form, made),
+    h("section", { class: "card" }, h("div", { class: "list" }, h("h3", { text: "Downloads" })),
+      h("a", { class: "button", href: "get", text: "Get" })),
   ];
 }
 

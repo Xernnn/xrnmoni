@@ -9,12 +9,14 @@
 // origins in its bridge_origins that send it.
 
 const DEFAULTS = { bridgePort: 8129, bridgeSecret: "" };
+// A private (incognito) window's tab is sent as its time and this, never its address or title.
+const PRIVATE = "Private";
 const IDLE_SECONDS = 60;      // match the agent's afk_threshold-ish
 const HEARTBEAT_MIN = 0.5;    // 30s: chunk long sessions + keep SW warm
 
 // In-memory current interval; mirrored to session storage so a service-worker
 // restart loses at most one heartbeat chunk.
-let current = null; // { url, title, domain, start }
+let current = null; // { url, title, domain, private, start }
 
 function domainOf(url) {
   try { return new URL(url).hostname || null; } catch { return null; }
@@ -55,25 +57,30 @@ function now() { return Date.now() / 1000; }
 // from a new interval.
 function newId() { return crypto.randomUUID().replaceAll("-", ""); }
 
+// What is sent for one stretch of a page.
+function interval(page, startTs, endTs) {
+  const out = { id: newId(), url: page.url, title: page.title, domain: page.domain };
+  if (page.private) out.private = true;
+  return Object.assign(out, { ts_start: startTs, ts_end: endTs, duration: endTs - startTs });
+}
+
 async function stop(endTs) {
   if (current && endTs > current.start) {
-    await post({
-      id: newId(),
-      url: current.url,
-      title: current.title,
-      domain: current.domain,
-      ts_start: current.start,
-      ts_end: endTs,
-      duration: endTs - current.start,
-    });
+    await post(interval(current, current.start, endTs));
   }
   current = null;
   await saveCurrent();
 }
 
-async function start(url, title, startTs) {
-  current = { url, title, domain: domainOf(url), start: startTs };
+async function start(page, startTs) {
+  current = Object.assign({}, page, { start: startTs });
   await saveCurrent();
+}
+
+// The tab as it is recorded: a private window's tabs are all one "Private" page.
+function pageOf(tab) {
+  if (tab.incognito) return { url: null, title: PRIVATE, domain: null, private: true };
+  return { url: tab.url, title: tab.title || "", domain: domainOf(tab.url), private: false };
 }
 
 // Re-evaluate what the user is actually looking at right now.
@@ -86,16 +93,15 @@ async function reeval() {
     tab = tabs && tabs[0];
   } catch { return; }
 
-  if (!tab || !tab.url) { await stop(now()); return; }
+  if (!tab || !(tab.url || tab.incognito)) { await stop(now()); return; }
 
-  const url = tab.url;
-  const title = tab.title || "";
+  const page = pageOf(tab);
   const t = now();
-  if (!current || current.url !== url) {
+  if (!current || current.url !== page.url || !current.private !== !page.private) {
     await stop(t);
-    await start(url, title, t);
-  } else if (current.title !== title) {
-    current.title = title; // same page, title updated (e.g. SPA)
+    await start(page, t);
+  } else if (current.title !== page.title) {
+    current.title = page.title; // same page, title updated (e.g. SPA)
     await saveCurrent();
   }
 }
@@ -105,9 +111,8 @@ async function reeval() {
 async function heartbeat() {
   if (current) {
     const t = now();
-    const url = current.url, title = current.title, domain = current.domain, start = current.start;
-    if (t > start) {
-      await post({ id: newId(), url, title, domain, ts_start: start, ts_end: t, duration: t - start });
+    if (t > current.start) {
+      await post(interval(current, current.start, t));
       current.start = t;
       await saveCurrent();
     }
@@ -125,6 +130,9 @@ chrome.idle.onStateChanged.addListener(async (state) => {
   if (state === "active") reeval();
   else await stop(now());   // idle or locked
 });
+
+// The toolbar button shows the extension is there; a click opens its options.
+chrome.action.onClicked.addListener(() => chrome.runtime.openOptionsPage());
 
 chrome.runtime.onStartup.addListener(reeval);
 chrome.runtime.onInstalled.addListener(reeval);

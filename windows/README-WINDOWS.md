@@ -17,7 +17,9 @@ main [README](../README.md)).
   `python3 server/xrnmoni.py token add den-pc --data <hub data folder>` prints one.
   It belongs to that device name, so use the same name below.
 - **The hub's address**, with its path if it has one: `https://hub.example.net/xrnmoni`.
-- **The files**, either of:
+- **The files**, any of:
+  - the **Windows** download on the hub's Get page (`<hub>/get`, opened with the device
+    token), or the `xrnmoni-windows-<version>.zip` of a release: the package below;
   - this repository's folder (the installer finds Python 3.10+, or installs it for the
     user with winget), or
   - the **`xrnmoni-windows`** package, from the Artifacts of a CI run (Actions, the latest
@@ -113,6 +115,21 @@ Release Firefox runs only signed extensions for good, so pick one:
 Then in `about:addons`, xrnmoni: **Run in Private Windows: Allow**, and its **Options**:
 paste the secret, **Save**, and copy the **Origin** (`moz-extension://...`, different in
 every Firefox profile) into `windows\install.bat -BridgeOrigin moz-extension://...`.
+
+## 3a. Private windows off (a child's PC)
+
+A private window is where xrnmoni records only "Private" and its time. On a child's PC you can
+close them in every Chromium browser at once, for every account, as machine policy that a
+standard (not administrator) account can't change. In an **administrator** PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File windows\admin\private-windows.ps1
+```
+
+It turns off Chrome's and Chromium's Incognito, Edge's InPrivate, and Brave's private and Tor
+windows; each browser takes it at its next start, and `chrome://policy` (`edge://policy`)
+lists it. `-Status` shows each value, `-Undo` allows them again. Give the child a standard
+account, or they can undo it.
 
 ## 4. Every day
 

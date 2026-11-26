@@ -53,6 +53,11 @@ def read(name):
         return f.read()
 
 
+def read_readme_windows():
+    with open(os.path.join(WINDOWS, "README-WINDOWS.md"), encoding="utf-8") as f:
+        return f.read()
+
+
 class PowerShellPitfallsTest(unittest.TestCase):
     def test_no_variable_followed_by_a_colon_in_strings(self):
         # "http://$ip:8000" reads $ip:8000 as a variable in a scope called "ip" (empty), and
@@ -97,6 +102,26 @@ class PerUserInstallTest(unittest.TestCase):
                 self.assertNotRegex(text, r"(?i)/rl\s+highest|RunLevel\s+Highest|RunAsAdministrator")
                 self.assertNotRegex(text, r"(?i)New-NetFirewallRule|netsh\s+advfirewall")
                 self.assertNotRegex(text, r"(?i)HKLM:|\$env:ProgramData|\$env:windir")
+
+    def test_private_windows_are_turned_off_by_machine_policy_in_every_chromium_browser(self):
+        # A parent closes private windows on a child's PC (decided 2026-11-27): a private window is
+        # where xrnmoni records only "Private" and its time. Machine policy, which a standard
+        # account can't change, so this one script needs an administrator and lives apart from
+        # the per-user ones the test above holds to that rule.
+        with open(os.path.join(WINDOWS, "admin", "private-windows.ps1"), encoding="utf-8-sig") as f:
+            text = f.read()
+        for key, name in ((r"HKLM:\SOFTWARE\Policies\Google\Chrome", "IncognitoModeAvailability"),
+                          (r"HKLM:\SOFTWARE\Policies\Chromium", "IncognitoModeAvailability"),
+                          (r"HKLM:\SOFTWARE\Policies\Microsoft\Edge", "InPrivateModeAvailability"),
+                          (r"HKLM:\SOFTWARE\Policies\BraveSoftware\Brave", "IncognitoModeAvailability"),
+                          (r"HKLM:\SOFTWARE\Policies\BraveSoftware\Brave", "TorDisabled")):
+            with self.subTest(name=name, key=key):
+                self.assertRegex(text, re.escape(f"Key = '{key}';") + r"\s+Name = '" + name + r"';\s+Off = 1 }")
+        self.assertIn("WindowsBuiltInRole]::Administrator", text)
+        self.assertIn("-PropertyType DWord", text)
+        self.assertNotRegex(text, r"(?i)Remove-Item\s+-LiteralPath \$p\.Key")  # never the whole key
+        self.assertIn("Private windows are off", text)
+        self.assertIn("private-windows.ps1", read_readme_windows())
 
     def test_binds_nothing_to_every_address(self):
         for path in scripts("*.ps1", "*.bat", "*.py"):
