@@ -310,6 +310,14 @@ class ExeTest(unittest.TestCase):
         self.assertIn("-m PyInstaller", text)
         self.assertIn("'xrnmoni-agent.spec'", text)
 
+    def test_the_package_carries_the_admin_scripts(self):
+        # private-windows.ps1 lives in windows/admin/, so the package a parent copies to the child's
+        # PC must include it; the top-level file copy above would miss the subfolder.
+        self.assertTrue(os.path.isfile(os.path.join(WINDOWS, "admin", "private-windows.ps1")))
+        text = read("build-exe.ps1")
+        self.assertRegex(text, r"Join-Path \$PSScriptRoot 'admin'")
+        self.assertRegex(text, r"Copy-Item -Recurse \$admin")
+
     def test_installer_can_use_the_exe_instead_of_python(self):
         text = read("install.ps1")
         self.assertIn("[switch]$UseExe", text)
