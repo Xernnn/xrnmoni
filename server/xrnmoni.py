@@ -30,6 +30,9 @@ may not strip that prefix. Standard library only, plus `bcrypt` to read the user
     GET    /api/tokens                the device tokens (the owner only): id, device, made, last post
     POST   /api/tokens                {"device"}: a new device token, answered once and never again
     DELETE /api/tokens/<id>           revokes one
+    GET    /api/viewers               who can sign in (the owner only): the owner, then the monitors
+    POST   /api/viewers               {"name", "password"}: adds a monitor who may watch, not manage
+    DELETE /api/viewers/<name>        removes a monitor (the owner's own account stays)
     GET    /api/downloads             what the downloads folder holds, with size, SHA-256 and a link
                                       good for an hour; for a viewer or a device token
     GET    /downloads/<name>?k=       one of them, by that link
@@ -38,8 +41,9 @@ may not strip that prefix. Standard library only, plus `bcrypt` to read the user
 
 Every read also takes device=NAME for one device. Times are epoch seconds; the dashboard sends the
 viewer's own midnights, so a day is the viewer's day. Reads need the sign-in cookie with an
-X-Xrn-Client header, or Basic auth, from a viewer: the users file's first user, and anyone named
-with --viewer. Device tokens only post events.
+X-Xrn-Client header, or Basic auth, from a viewer: the users file's first user (the owner), anyone
+named with --viewer, and the monitors the owner adds on the People page (kept in viewers.json). A
+monitor watches but manages nothing. Device tokens only post events.
 
     python3 xrnmoni.py --data DIR [--host 127.0.0.1] [--port 5240] [--users FILE] [--prefix /xrnmoni]
     python3 xrnmoni.py user add|remove|list [NAME] --data DIR [--users FILE]
@@ -778,6 +782,60 @@ class Tokens:
         return True
 
 
+class Monitors:
+    """The people the owner added on the People page to watch the dashboard. Each is a name in the
+    users file; this list, in viewers.json, says which of them may see the data without being able to
+    manage anything. It persists, so a restart keeps them without a `--viewer` on the command line."""
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.writing = threading.Lock()
+        self.seen = None
+        self.found = []
+
+    def read(self):
+        try:
+            stamp = os.stat(self.path).st_mtime_ns, os.path.getsize(self.path)
+        except OSError:
+            stamp = None
+        with self.lock:
+            if stamp == self.seen:
+                return self.found
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                doc = json.load(f)
+            found = doc.get("viewers") if isinstance(doc, dict) else None
+            found = ([v for v in found if isinstance(v, dict) and USER_NAME.fullmatch(str(v.get("name", "")))]
+                     if isinstance(found, list) else [])
+        except FileNotFoundError:
+            found = []
+        except (OSError, ValueError) as e:
+            log(f"{self.path} can't be read, so the monitors read before it hold: {e}")
+            return self.found
+        with self.lock:
+            self.seen, self.found = stamp, found
+        return found
+
+    def names(self):
+        return {v["name"] for v in self.read()}
+
+    def add(self, name):
+        with self.writing:
+            found = self.read()
+            if any(v["name"] == name for v in found):
+                return
+            entry = {"name": name, "created": int(time.time())}
+            write_private(self.path, json.dumps({"viewers": [*found, entry]}, ensure_ascii=False, indent=1))
+
+    def remove(self, name):
+        with self.writing:
+            found = self.read()
+            kept = [v for v in found if v["name"] != name]
+            if len(kept) != len(found):
+                write_private(self.path, json.dumps({"viewers": kept}, ensure_ascii=False, indent=1))
+
+
 # ---- downloads ----------------------------------------------------------------------------------
 
 class Downloads:
@@ -886,6 +944,49 @@ def read_names(users_path):
     except OSError:
         pass
     return found
+
+
+def add_user(path, name, password):
+    """Add a user to the htpasswd file at `path`, or change an existing one's password, keeping the
+    file's order (so the first line — the owner — stays the owner). Returns True if the name was new.
+    Raises ValueError on a bad name or a password under 8 characters."""
+    if not isinstance(name, str) or not USER_NAME.fullmatch(name):
+        raise ValueError("a name is letters, digits, . _ or -, starting with a letter or digit")
+    if not isinstance(password, str) or len(password) < 8:
+        raise ValueError("use a password of 8 characters or more")
+    import bcrypt
+
+    hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        lines = []
+    replaced, kept = False, []
+    for line in lines:
+        if line.partition(":")[0] == name:
+            kept.append(f"{name}:{hashed}")
+            replaced = True
+        else:
+            kept.append(line)
+    if not replaced:
+        kept.append(f"{name}:{hashed}")
+    write_private(path, "".join(line + "\n" for line in kept))
+    return not replaced
+
+
+def remove_user(path, name):
+    """Remove a user from the htpasswd file. Returns True if they were there."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return False
+    kept = [line for line in lines if line.partition(":")[0] != name]
+    if len(kept) == len(lines):
+        return False
+    write_private(path, "".join(line + "\n" for line in kept))
+    return True
 
 
 def basic_login(header):
@@ -1274,6 +1375,10 @@ class App:
                  legacy_token=None):
         self.data = data
         self.users = users or os.path.join(data, "users")
+        # Monitors can be added and removed from the web only when this server owns the users file
+        # (it lives in the data dir). A shared file (one other services sign in with) is managed on
+        # the server with `user add`, so the web never writes another service's accounts.
+        self.owns_users = os.path.dirname(os.path.abspath(self.users)) == os.path.abspath(data)
         self.web = web or os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
         self.prefix = prefix.rstrip("/")
         self.retain_days = retain_days
@@ -1291,11 +1396,12 @@ class App:
         self.categories = Categories(os.path.join(data, "categories.json"))
         self.categories_lock = threading.Lock()
         self.downloads = Downloads(os.path.join(data, "downloads"))
+        self.monitors = Monitors(os.path.join(data, "viewers.json"))
         self.changes = Changes()
         self.pages = {}  # web file -> (stamp, ETag, bytes)
 
     def is_viewer(self, user):
-        return user in self.viewers or self.is_owner(user)
+        return user in self.viewers or user in self.monitors.names() or self.is_owner(user)
 
     def is_owner(self, user):
         """The users file's first user: the only one who makes and revokes device tokens."""
@@ -1542,6 +1648,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.get_downloads()
         if path == "/api/tokens":
             return self.get_tokens() if self.owner() else None
+        if path == "/api/viewers":
+            return self.get_viewers() if self.owner() else None
         reads = {"/api/devices": self.get_devices, "/api/day": self.get_day, "/api/days": self.get_days,
                  "/api/detail": self.get_detail, "/api/activity": self.get_activity,
                  "/api/export": self.get_export, "/api/summary": self.get_summary,
@@ -1575,6 +1683,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, json.dumps({"ok": True, "user": user}), JSON, {"Set-Cookie": cookie})
         if path == "/api/tokens":
             return self.post_token()
+        if path == "/api/viewers":
+            return self.post_viewer()
         if path != "/api/events":
             return self.send(404, "not found")
         device, ok = self.device_token()
@@ -1661,6 +1771,56 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(503, "the tokens can't be written")
         return self.send_json({"id": token[8:16], "device": device.strip(), "token": token})
 
+    def get_viewers(self):
+        """The people who can sign in: the owner, then the monitors the owner added. For the owner only."""
+        names = read_names(self.app.users)
+        added = {v["name"]: v.get("created") for v in self.app.monitors.read()}
+        people = [{"name": name, "owner": i == 0, "added": (None if i == 0 else added.get(name))}
+                  for i, name in enumerate(names)]
+        return self.send_json({"people": people, "manageable": self.app.owns_users})
+
+    def post_viewer(self):
+        """Adds a monitor: a name and password the owner gives, who may then watch the dashboard but
+        manage nothing. For the owner only, and only when this server owns the users file."""
+        if not self.owner():
+            return None
+        if not self.app.owns_users:
+            return self.send(409, "this dashboard shares its sign-in with other services; add a monitor "
+                                  "on the server with: user add")
+        doc = self.body()
+        if doc is None:
+            return None
+        name = doc.get("name") if isinstance(doc, dict) else None
+        password = doc.get("password") if isinstance(doc, dict) else None
+        if isinstance(name, str) and name == next(iter(read_names(self.app.users)), None):
+            return self.send(400, "that is the owner's own account")
+        try:
+            add_user(self.app.users, name, password)
+        except ValueError as e:
+            return self.send(400, str(e))
+        except OSError as e:
+            log(f"viewers: {e}")
+            return self.send(503, "the account can't be written")
+        self.app.monitors.add(name)
+        return self.send_json({"name": name})
+
+    def delete_viewer(self, name):
+        """Removes a monitor: their account and their place on the viewers list. For the owner only.
+        The owner's own account stays."""
+        if not self.owner():
+            return None
+        if not self.app.owns_users:
+            return self.send(409, "manage who signs in on the server with: user remove")
+        if not USER_NAME.fullmatch(name):
+            return self.send(404, "no such monitor")
+        if name == next(iter(read_names(self.app.users)), None):
+            return self.send(400, "the owner's own account stays")
+        gone = remove_user(self.app.users, name)
+        self.app.monitors.remove(name)
+        if not gone:
+            return self.send(404, "no such monitor")
+        return self.send_json({"ok": True})
+
     def do_DELETE(self):
         path = self.route()
         if path.startswith("/api/tokens/"):
@@ -1670,6 +1830,8 @@ class Handler(BaseHTTPRequestHandler):
             if not TOKEN_ID.fullmatch(token_id) or not self.app.tokens.revoke(token_id):
                 return self.send(404, "no such token")
             return self.send_json({"ok": True})
+        if path.startswith("/api/viewers/"):
+            return self.delete_viewer(path[len("/api/viewers/"):])
         if path != "/api/session":
             return self.send(404, "not found")
         # Emptying the browser's cookie alone left any copy of it signing in for its full 30 days.
@@ -1685,7 +1847,8 @@ class Handler(BaseHTTPRequestHandler):
             if q.get("device") is not None and d["device"] != q["device"]:
                 continue
             out.append({**d, "now": self.app.now_doing(d["device"])})
-        return self.send_json({"devices": out, "now": time.time(), "seq": self.app.changes.seq})
+        return self.send_json({"devices": out, "now": time.time(), "seq": self.app.changes.seq,
+                               "owner": self.app.is_owner(self.viewer())})
 
     def get_day(self, q):
         since, until = time_range(q, MAX_RANGE_S)
@@ -1978,28 +2141,17 @@ def user_cli(argv):
         return
     if not args.name or not USER_NAME.fullmatch(args.name):
         sys.exit("give a name of letters, digits, . _ or -, starting with a letter or digit")
-    try:
-        with open(path, encoding="utf-8") as f:
-            lines = f.read().splitlines()
-    except FileNotFoundError:
-        lines = []
-    others = [line for line in lines if line.partition(":")[0] != args.name]
     if args.action == "remove":
-        if len(others) == len(lines):
+        if not remove_user(path, args.name):
             sys.exit(f"{args.name} isn't in {path}")
-        write_private(path, "".join(line + "\n" for line in others))
         print(f"Removed {args.name}.", file=sys.stderr)
         return
     password = read_password()
-    if len(password) < 8:
-        sys.exit("use a password of 8 characters or more")
-    import bcrypt
-    hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-    kept = [line if line.partition(":")[0] != args.name else f"{args.name}:{hashed}" for line in lines]
-    if len(others) == len(lines):
-        kept.append(f"{args.name}:{hashed}")
-    write_private(path, "".join(line + "\n" for line in kept))
-    print(f"{args.name} can sign in{'' if read_names(path)[0] == args.name else ' once named with --viewer'}.",
+    try:
+        add_user(path, args.name, password)
+    except ValueError as e:
+        sys.exit(str(e))
+    print(f"{args.name} can sign in{'' if read_names(path)[0] == args.name else ' once added as a monitor (People page) or named with --viewer'}.",
           file=sys.stderr)
 
 

@@ -92,6 +92,21 @@ Firefox only takes an unsigned extension in its ESR, Developer and Nightly build
 tabs are recorded as time under "Private", never their pages. To stop monitoring a device,
 **Revoke** its token under **Devices**, then uninstall it there.
 
+### Let another parent watch too
+
+Both parents can watch the same child, each with their own sign-in, and neither has to be
+technical. On the dashboard, open **People** → **Add a monitor**, type the other parent a name
+and a password, **Add**. They then open the same web address, sign in with that name and
+password, and see everything you see — the devices, the day, the week — but can change nothing
+and can't add or remove anyone. Take their access away any time with **Remove** on that page.
+
+A monitor's account only opens this dashboard; it reaches none of your other services. Hand them
+[docs/for-a-watching-parent.md](docs/for-a-watching-parent.md), a plain page with nothing
+technical in it.
+
+(The owner — the first account — is you, made once when the hub was set up. The People page
+appears only for you.)
+
 ---
 
 ## 1. Server (the hub: run once, on whichever machine is always on)
@@ -126,8 +141,15 @@ console, the log (`xrnmoni.log`).
 (`user add NAME`, `user remove NAME`, `user list`; the password can also be piped in).
 It signs in with an `xrn_session` cookie (HttpOnly, SameSite=Strict, 30 days); ten
 wrong passwords from one address lock it out for 15 minutes. Signing out ends that
-cookie for good. With `--users` pointing at a users file other xrn services share,
-they share the sign-in and sign-out too.
+cookie for good. The first user is the **owner**, who manages everything.
+
+**People (more than one parent).** The owner can let others watch, each with their own
+sign-in, from the dashboard's **People** page — **Add a monitor** with a name and password,
+or **Remove** one. A monitor sees everything the owner sees but changes nothing and can't add
+or remove anyone. The page works only when xrnmoni keeps its own users file (the default,
+`DIR/users`): there a monitor's account opens this dashboard and nothing else. If instead
+`--users` points at a file other services share, add people on the server with `user add` and
+`--viewer`, and the sign-in is shared with those services — so keep a monitor off a shared file.
 
 **Device tokens.** Each agent posts with its own token: put the one `token add NAME`
 printed in that machine's agent config as `token`. The owner (the users file's first user)
