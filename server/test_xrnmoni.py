@@ -696,6 +696,109 @@ class ViewerTest(HubTest):
         self.assertEqual(200, self.call("GET", "/api/devices", auth=("guest", GUEST))[0])
 
 
+class MonitorsTest(HubTest):
+    """The People page: the owner adds another parent as a monitor, who then watches the same child's
+    devices but changes nothing. The users file is in the data dir, so the server owns it."""
+
+    GRAN = "grandma-pass-1"
+
+    def add_monitor(self, name="gran", password=None, auth=("alex", RIGHT), headers=None):
+        body = {"name": name, "password": self.GRAN if password is None else password}
+        status, raw, _ = self.call("POST", "/api/viewers", body, headers, auth=auth)
+        return status, (json.loads(raw) if raw.startswith(b"{") else raw)
+
+    def test_a_monitor_the_owner_adds_can_watch_but_not_manage(self):
+        self.post([ev("app", T0, T0 + 60, app="YouTube")])  # some data on the child's "laptop"
+        status, made = self.add_monitor()
+        self.assertEqual(200, status, made)
+        self.assertEqual("gran", made["name"])
+        # Gran can sign in and see the same devices as the owner.
+        self.assertEqual(200, self.call("GET", "/api/devices", auth=("gran", self.GRAN))[0])
+        self.assertEqual(self.get("/api/day?since=%d&until=%d" % (T0 - 86400, T0 + 86400))["devices"],
+                         self.get("/api/day?since=%d&until=%d" % (T0 - 86400, T0 + 86400), auth=("gran", self.GRAN))["devices"])
+        # ...but manages nothing: no devices, no people.
+        self.assertEqual(403, self.call("GET", "/api/tokens", auth=("gran", self.GRAN))[0])
+        self.assertEqual(403, self.call("POST", "/api/tokens", {"device": "x"}, auth=("gran", self.GRAN))[0])
+        self.assertEqual(403, self.call("GET", "/api/viewers", auth=("gran", self.GRAN))[0])
+        self.assertEqual(403, self.add_monitor("eve", auth=("gran", self.GRAN))[0])
+        self.assertEqual(403, self.call("DELETE", "/api/viewers/gran", auth=("gran", self.GRAN))[0])
+
+    def test_the_people_list_names_the_owner_and_each_monitor(self):
+        self.add_monitor("gran")
+        people = self.get("/api/viewers")
+        self.assertTrue(people["manageable"])
+        byname = {p["name"]: p for p in people["people"]}
+        self.assertTrue(byname["alex"]["owner"])
+        self.assertIsNone(byname["alex"]["added"])
+        self.assertFalse(byname["gran"]["owner"])
+        self.assertIsNotNone(byname["gran"]["added"])
+        # "guest" is in the users file but was never made a monitor, so it isn't a viewer.
+        self.assertEqual(403, self.call("GET", "/api/devices", auth=("guest", GUEST))[0])
+
+    def test_removing_a_monitor_stops_them_seeing_anything(self):
+        self.add_monitor("gran")
+        self.assertEqual(200, self.call("GET", "/api/devices", auth=("gran", self.GRAN))[0])
+        self.assertEqual(200, self.call("DELETE", "/api/viewers/gran")[0])
+        for code in (self.call("GET", "/api/devices", auth=("gran", self.GRAN))[0],):
+            self.assertIn(code, (401, 403))
+        self.assertNotIn("gran", [p["name"] for p in self.get("/api/viewers")["people"]])
+
+    def test_a_monitor_survives_a_restart(self):
+        self.add_monitor("gran")
+        again = srv.App(self.data, self.users)
+        self.assertTrue(again.is_viewer("gran"))
+        self.assertFalse(again.is_viewer("guest"))
+        again.store.db.close()
+
+    def test_the_owner_account_is_protected(self):
+        self.assertEqual(400, self.add_monitor("alex")[0])          # can't re-add the owner as a monitor
+        self.assertEqual(400, self.call("DELETE", "/api/viewers/alex")[0])  # can't remove the owner
+        self.assertEqual(200, self.call("GET", "/api/devices")[0])  # owner still signs in
+
+    def test_a_bad_name_or_short_password_is_refused(self):
+        self.assertEqual(400, self.add_monitor("has space", "longenough")[0])
+        self.assertEqual(400, self.add_monitor("gran", "short")[0])
+        self.assertEqual(400, self.call("POST", "/api/viewers", {"name": "gran"}, auth=("alex", RIGHT))[0])
+        self.assertEqual([], srv.App(self.data, self.users).monitors.read())
+
+    def test_another_site_cant_add_a_monitor(self):
+        status, _ = self.add_monitor("eve", headers={"Origin": "https://evil.example", "Sec-Fetch-Site": "cross-site"})
+        self.assertEqual(403, status)
+
+    def test_the_owner_flag_tells_the_page_who_may_manage(self):
+        self.add_monitor("gran")
+        self.assertTrue(self.get("/api/devices")["owner"])
+        self.assertFalse(self.get("/api/devices", auth=("gran", self.GRAN))["owner"])
+
+
+class SharedUsersMonitorsTest(HubTest):
+    """When the dashboard signs in with a shared users file (outside the data dir), it never writes
+    accounts from the web: monitors are managed on the server."""
+
+    def setUp(self):
+        super().setUp()
+        elsewhere = os.path.join(self.tmp.name, "elsewhere")  # a users file outside the data dir
+        os.makedirs(elsewhere, exist_ok=True)
+        shared = os.path.join(elsewhere, "users")
+        os.replace(self.users, shared)
+        self.app.store.db.close()
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.users = shared
+        self.app = srv.App(self.data, shared)
+        handler = type("H", (srv.Handler,), {"app": self.app})
+        self.httpd = srv.Server(("127.0.0.1", 0), handler)
+        self.port = self.httpd.server_address[1]
+        self.base = f"http://127.0.0.1:{self.port}"
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def test_the_web_refuses_to_add_or_remove_accounts(self):
+        self.assertFalse(self.app.owns_users)
+        self.assertFalse(self.get("/api/viewers")["manageable"])
+        self.assertEqual(409, self.call("POST", "/api/viewers", {"name": "gran", "password": "longenough"})[0])
+        self.assertEqual(409, self.call("DELETE", "/api/viewers/gran")[0])
+
+
 class DeviceTokenTest(HubTest):
     """The dashboard's Devices page: the owner makes a token for a new device there, without ssh."""
 

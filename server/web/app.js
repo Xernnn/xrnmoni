@@ -16,6 +16,7 @@ const $tip = document.getElementById("tip");
 
 let state = readHash();
 let devices = [];
+let isOwner = false; // the signed-in person is the owner (may manage devices and monitors)
 let skew = 0; // the server's clock minus this one, in seconds
 let seq = 0;
 let signedIn = false;
@@ -176,6 +177,7 @@ function deviceParam(device = state.device) {
 async function loadDevices() {
   const doc = await getJSON("api/devices");
   devices = doc.devices;
+  isOwner = !!doc.owner;
   skew = doc.now - Date.now() / 1000;
   if (!seq) seq = doc.seq;
   return devices;
@@ -185,7 +187,7 @@ async function loadDevices() {
 
 function readHash() {
   const p = new URLSearchParams(location.hash.slice(1));
-  const view = ["day", "week", "rules", "devices"].includes(p.get("v")) ? p.get("v") : "day";
+  const view = ["day", "week", "rules", "devices", "people"].includes(p.get("v")) ? p.get("v") : "day";
   const date = parseKey(p.get("d")) ? p.get("d") : today();
   return { view, date, device: p.get("dev") || "", colour: p.get("c") === "cat" ? "cat" : "app" };
 }
@@ -282,7 +284,7 @@ function header() {
     onchange: (e) => parseKey(e.target.value) && go({ date: e.target.value }),
   });
   const step = state.view === "week" ? 7 : 1;
-  const plain = state.view === "rules" || state.view === "devices"; // no dates, devices or CSV
+  const plain = ["rules", "devices", "people"].includes(state.view); // no dates, device picker or CSV
   const dates = plain ? null : h("div", { class: "dates" },
     h("button", { class: "icon-btn", type: "button", "aria-label": "Earlier", text: "‹", onclick: () => go({ date: shiftKey(state.date, -step) }) }),
     date,
@@ -301,7 +303,8 @@ function header() {
   return h("header", { class: "bar" },
     h("div", { class: "left" },
       h("img", { class: "tile", src: "icon.svg", alt: "xrnmoni" }),
-      segmented([["day", "Day"], ["week", "Week"], ["rules", "Rules"], ["devices", "Devices"]], state.view,
+      segmented([["day", "Day"], ["week", "Week"], ["rules", "Rules"],
+        ...(isOwner ? [["devices", "Devices"], ["people", "People"]] : [])], state.view,
         (view) => go({ view }))),
     plain ? null : h("div", { class: "filters" },
       dates, picker, segmented([["app", "Apps"], ["cat", "Categories"]], state.colour, (colour) => go({ colour }))),
@@ -329,7 +332,7 @@ async function render(live = false) {
   }
   let body;
   try {
-    body = await { day: dayView, week: weekView, rules: rulesView, devices: devicesView }[state.view]();
+    body = await { day: dayView, week: weekView, rules: rulesView, devices: devicesView, people: peopleView }[state.view]();
   } catch (e) {
     if (e instanceof Unauthorized) return;
     if (live) return; // keep what's on screen; the next change tries again
@@ -911,6 +914,91 @@ async function devicesView() {
     h("section", { class: "card" }, h("div", { class: "list" }, h("h3", { text: "Downloads" })),
       h("a", { class: "button", href: "get", text: "Get" })),
   ];
+}
+
+// The People page (owner only): the people who can watch the dashboard. The owner, plus the
+// monitors the owner adds here — each sees everything a device sends, and can change nothing.
+async function peopleView() {
+  const res = await fetch("api/viewers", { credentials: "same-origin", headers: CLIENT });
+  if (res.status === 401) {
+    showSignIn();
+    throw new Unauthorized();
+  }
+  if (res.status === 403) return h("div", { class: "empty", text: "Owner only" });
+  if (!res.ok) throw new Error(String(res.status));
+  const { people, manageable } = await res.json();
+
+  const box = h("div", { class: "tokens" });
+  const row = (person) => {
+    const el = h("div", { class: "token" },
+      h("span", { class: "n", text: person.name, title: person.name }),
+      h("span", { class: "age", text: person.owner ? "you · owner" : (person.added ? `monitor · added ${ago(nowS() - person.added)}` : "monitor") }));
+    if (!person.owner && manageable) {
+      const remove = h("button", { type: "button", text: "Remove" });
+      remove.addEventListener("click", async () => {
+        if (remove.textContent !== "Remove?") {
+          remove.textContent = "Remove?"; // a second click to be sure
+          return;
+        }
+        remove.disabled = true;
+        const del = await fetch(`api/viewers/${encodeURIComponent(person.name)}`, { method: "DELETE", credentials: "same-origin", headers: CLIENT })
+          .catch(() => null);
+        if (del && del.status === 401) return showSignIn();
+        if (!del || !del.ok) {
+          remove.disabled = false;
+          remove.textContent = del ? `Error ${del.status}` : "Server unreachable";
+          return;
+        }
+        el.remove();
+      });
+      el.append(remove);
+    }
+    return el;
+  };
+  box.replaceChildren(...people.map(row));
+
+  const cards = [h("section", { class: "card" }, h("div", { class: "list" }, h("h3", { text: "People" })), box)];
+
+  if (manageable) {
+    const name = h("input", { placeholder: "Name", "aria-label": "Monitor name", maxlength: "64", autocomplete: "off", required: true });
+    const pass = h("input", { type: "password", placeholder: "Password", "aria-label": "Password", autocomplete: "new-password", minlength: "8", required: true });
+    const add = h("button", { class: "primary", type: "submit", text: "Add a monitor" });
+    const msg = h("span", { class: "msg" });
+    const form = h("form", {
+      class: "actions",
+      onsubmit: async (e) => {
+        e.preventDefault();
+        add.disabled = true;
+        msg.textContent = "";
+        try {
+          const post = await fetch("api/viewers", {
+            method: "POST", credentials: "same-origin",
+            headers: { ...CLIENT, "Content-Type": "application/json" },
+            body: JSON.stringify({ name: name.value.trim(), password: pass.value }),
+          });
+          if (post.status === 401) return showSignIn();
+          if (!post.ok) {
+            msg.textContent = (await post.text()) || `Error ${post.status}`;
+            return;
+          }
+          const p = await post.json();
+          box.append(row({ name: p.name, owner: false, added: nowS() }));
+          name.value = "";
+          pass.value = "";
+          msg.textContent = `${p.name} can now sign in`;
+        } catch {
+          msg.textContent = "Server unreachable";
+        } finally {
+          add.disabled = false;
+        }
+      },
+    }, name, pass, add, msg);
+    cards.push(h("section", { class: "card" }, h("div", { class: "list" }, h("h3", { text: "Add a monitor" })), form));
+  } else {
+    cards.push(h("section", { class: "card" },
+      h("div", { class: "none", text: "This dashboard shares its sign-in with other services, so monitors are added on the server." })));
+  }
+  return cards;
 }
 
 // ---- export, tooltips, live updates ------------------------------------------------------------
