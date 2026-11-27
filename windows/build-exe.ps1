@@ -46,6 +46,10 @@ Copy-Item -Recurse (Join-Path $dist 'xrnmoni-agent') (Join-Path $pkg 'xrnmoni-ag
 Get-ChildItem -Path (Join-Path $PSScriptRoot '*') -File -Include '*.ps1', '*.bat', '*.md' |
     Where-Object { $_.Name -ne 'build-exe.ps1' } |
     Copy-Item -Destination (Join-Path $pkg 'windows')
+# The admin-only scripts (private-windows.ps1 and any others) go in their own folder, so the
+# package a parent copies to the child's PC can turn off private browsing without the repo.
+$admin = Join-Path $PSScriptRoot 'admin'
+if (Test-Path $admin) { Copy-Item -Recurse $admin (Join-Path $pkg 'windows\admin') }
 Copy-Item -Recurse (Join-Path $root 'extension') (Join-Path $pkg 'extension')
 Write-Host "`nBuilt $exe" -ForegroundColor Green
 Write-Host "Copy $pkg to the PC and run windows\install.bat there (it installs the exe)."
